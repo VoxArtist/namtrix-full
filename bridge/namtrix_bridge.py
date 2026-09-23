@@ -17,7 +17,8 @@ is stripped, the rig's delay is left in. That is what a DAW-recorded take looks
 like, and what the trainer expects alongside an explicit `delay`. Pre-aligning
 here would risk the correction being applied twice.
 
-Requires the parametric trainer's environment (sounddevice, numpy, soundfile).
+Needs only numpy and sounddevice. The delay measurement is vendored in
+`latency.py` rather than imported from the trainer, so this runs anywhere.
 """
 
 from __future__ import annotations
@@ -31,20 +32,26 @@ import threading
 import time as _time
 import traceback
 import wave
+import socketserver
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-DEFAULT_TRAINER = Path(
-    "/Users/miguelmarques/Documents/Codex/2026-09-17/i-x20/work/neural-amp-modeler-parametric"
-)
+# Importable whether this is run as a script, as a module, or from inside a
+# PyInstaller bundle, none of which agree about what is on sys.path.
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 PREAMBLE_PAD_SECONDS = 0.25   # silence after the preamble before the signal starts
 OPEN_TIMEOUT_SECONDS = 10.0   # PortAudio can block indefinitely opening a dead device
 
 # Set when a capture thread never returned: the device layer cannot be trusted again
 # in this process, so say so rather than hanging every later request too.
 _wedged = {"device": False}
+
+# Takes written during this run, which are the only files /api/take will serve.
+_written_takes: set[str] = set()
+_written_lock = threading.Lock()
 
 
 class BridgeError(RuntimeError):
@@ -55,7 +62,8 @@ class BridgeError(RuntimeError):
 # lazy imports: the page must still load and explain itself if audio is broken
 # ----------------------------------------------------------------------------
 
-_audio_state = {"ready": False, "error": None}
+_audio_state = {"ready": False, "error": None, "starting": False}
+_audio_lock = threading.Lock()
 
 
 def _audio():
@@ -64,14 +72,22 @@ def _audio():
         return _audio_state["mods"]
     if _audio_state["error"]:
         raise BridgeError(_audio_state["error"])
+    with _audio_lock:
+        if _audio_state["ready"]:
+            return _audio_state["mods"]
+        if _audio_state["error"]:
+            raise BridgeError(_audio_state["error"])
+        return _import_audio()
+
+
+def _import_audio():
     try:
-        trainer = Path(os.environ.get("NAMTRIX_TRAINER", DEFAULT_TRAINER))
-        if trainer.is_dir() and str(trainer) not in sys.path:
-            sys.path.insert(0, str(trainer))
         import numpy as np
         import sounddevice as sd
-        from nam.capture.latency import BlipPreamble, measure_delay
 
+        from latency import BlipPreamble, measure_delay
+
+        sd.query_devices()          # forces PortAudio to initialise now, not later
         _audio_state["mods"] = {
             "np": np, "sd": sd,
             "BlipPreamble": BlipPreamble, "measure_delay": measure_delay,
@@ -81,8 +97,8 @@ def _audio():
     except Exception as exc:  # noqa: BLE001 - surfaced to the UI verbatim
         _audio_state["error"] = (
             f"Audio stack unavailable: {type(exc).__name__}: {exc}. "
-            "Run this with the trainer's Python (nam-venv), or set NAMTRIX_TRAINER "
-            "to the neural-amp-modeler-parametric checkout."
+            "The packaged app carries its own copy of numpy and sounddevice; if you "
+            "are running the script directly, install them first."
         )
         raise BridgeError(_audio_state["error"]) from exc
 
@@ -314,7 +330,6 @@ def do_capture(body):
             "Nothing was saved. Close other audio apps or raise the buffer size."
         )
 
-    played = preamble.as_played()
     results = []
     for chain in chains:
         channel = int(chain["channel"])
@@ -325,8 +340,23 @@ def do_capture(body):
             )
         captured = recording[:, channel - 1].copy()
 
-        latency_result = measure_delay(captured, played)
-        delay = getattr(latency_result, "delay", None)
+        latency_result = measure_delay(captured, preamble)
+        delay, delay_note = latency_result.delay, None
+        if delay is None:
+            delay_note = (
+                "No response to the timing blips. Check this chain is actually "
+                "patched and passing signal."
+            )
+        elif latency_result.disagreement_too_high:
+            # The two blips read the chain a second apart; when they disagree the
+            # average blends two arrival times and means nothing. Say so rather
+            # than writing a confident number into the chain settings.
+            blips = ", ".join(str(d) for d in latency_result.blip_delays)
+            delay_note = (
+                f"The two timing blips disagree ({blips} samples), so the delay "
+                "cannot be trusted. The stream most likely glitched; re-record."
+            )
+            delay = None
 
         # keep the signal file's timebase: drop our preamble, leave the rig's delay in
         body_audio = captured[signal_start:]
@@ -339,12 +369,15 @@ def do_capture(body):
 
         target = targets[chain["name"]]
         write_wav_24(target, body_audio, sample_rate)
+        with _written_lock:
+            _written_takes.add(str(target.resolve()))
         results.append({
             "chain": chain["name"],
             "channel": channel,
             "file": str(target),
             "delay": None if delay is None else int(delay),
             "delayDetected": delay is not None,
+            "delayNote": delay_note,
             "rms": dbfs(body_audio),
             "peak": peak_dbfs(body_audio),
             "clipped": bool(np.max(np.abs(body_audio)) >= 0.999) if len(body_audio) else False,
@@ -427,18 +460,59 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_GET(self):
         if self.path.startswith("/api/health"):
-            payload = {"ok": True, "version": VERSION, "audio": True, "error": None}
-            try:
-                _audio()
-            except BridgeError as exc:
-                payload.update(audio=False, error=str(exc))
-            return self._json(payload)
+            # Never block here. Importing numpy and opening PortAudio takes the
+            # better part of twenty seconds from a bundled app, and a page that
+            # asked during that window would be told there is no audio and would
+            # quietly turn itself into Lite for the rest of the session.
+            if _audio_state["ready"]:
+                return self._json({"ok": True, "version": VERSION, "audio": True,
+                                   "starting": False, "error": None})
+            if _audio_state["error"]:
+                return self._json({"ok": True, "version": VERSION, "audio": False,
+                                   "starting": False, "error": _audio_state["error"]})
+            return self._json({"ok": True, "version": VERSION, "audio": False,
+                               "starting": True, "error": None})
         if self.path.startswith("/api/devices"):
             try:
                 return self._json({"ok": True, "devices": list_devices()})
             except BridgeError as exc:
                 return self._json({"ok": False, "error": str(exc)}, 503)
+        if self.path.startswith("/api/take"):
+            return self._serve_take()
+        if self.path.startswith("/api/quit"):
+            self._json({"ok": True})
+            threading.Timer(0.3, lambda: os._exit(0)).start()
+            return
         return super().do_GET()
+
+    def _serve_take(self):
+        """
+        Hand a recorded take back to the page so it can analyse it.
+
+        The page does the knob check in the browser - one implementation for Lite
+        and Full both - and a browser cannot open a path off the filesystem. It
+        can fetch one from us, since we are the same origin.
+
+        Only files this bridge wrote in this session are served. The set is
+        closed, so a crafted path cannot walk out of it.
+        """
+        from urllib.parse import parse_qs, urlparse
+
+        wanted = (parse_qs(urlparse(self.path).query).get("file") or [""])[0]
+        resolved = str(Path(wanted).expanduser().resolve()) if wanted else ""
+        with _written_lock:
+            allowed = resolved in _written_takes
+        if not allowed or not Path(resolved).is_file():
+            return self._json(
+                {"ok": False, "error": "Not a take this bridge recorded."}, 404
+            )
+        data = Path(resolved).read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", "audio/wav")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
 
     def do_POST(self):
         routes = {"/api/capture": do_capture, "/api/test-route": do_test_route}
@@ -466,31 +540,115 @@ class Handler(SimpleHTTPRequestHandler):
             self._lock.release()
 
 
+class Server(ThreadingHTTPServer):
+    """
+    A server that binds immediately.
+
+    ``http.server`` looks up the fully-qualified name of the address it binds
+    to, purely to fill in a field used by CGI scripts this has none of. Inside
+    the packaged app that lookup finds no resolver willing to answer for
+    127.0.0.1 and blocks until DNS gives up - a measured 35 seconds, every
+    launch, before the window can open. Outside the bundle the same call returns
+    at once, which is what made it look like the audio devices were slow.
+    """
+
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = host
+        self.server_port = port
+
+
+def _bundled_root() -> Path:
+    """
+    Where index.html lives. Inside a PyInstaller app that is the unpacked bundle;
+    running from a checkout it is the folder above this file.
+    """
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+    return Path(__file__).resolve().parent.parent
+
+
+def _first_free_port(host: str, start: int, tries: int = 20) -> int:
+    """
+    A port nobody else is on. A second copy of the app, or anything else already
+    holding 8765, should not turn into a crash the user has to interpret.
+    """
+    import socket
+
+    for port in range(start, start + tries):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                probe.bind((host, port))
+                return port
+            except OSError:
+                continue
+    raise BridgeError(
+        f"No free port between {start} and {start + tries - 1}. Quit whatever is "
+        "using them, or pass --port."
+    )
+
+
 def main():
     ap = argparse.ArgumentParser(description="NAMTRIX capture bridge")
-    ap.add_argument("--root", default=str(Path(__file__).resolve().parent.parent))
-    ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument("--root", default=None)
+    ap.add_argument("--port", type=int, default=None)
     ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--no-browser", action="store_true",
+                    help="Do not open a browser window on start.")
     a = ap.parse_args()
 
     mimetypes.add_type("application/javascript", ".js")
-    Handler.root = Path(a.root).resolve()
+    Handler.root = Path(a.root).resolve() if a.root else _bundled_root()
+
+    explicit_port = a.port is not None
+    port = a.port if explicit_port else _first_free_port(a.host, 8765)
 
     print(f"NAMTRIX bridge {VERSION}")
     print(f"  serving {Handler.root}")
-    try:
-        _audio()
-        print("  audio ready")
-    except BridgeError as exc:
-        print(f"  WARNING: {exc}")
-        print("  The page will still load; capture stays switched off.")
-    print(f"\n  open  http://{a.host}:{a.port}\n  stop  Ctrl-C\n")
 
-    server = ThreadingHTTPServer((a.host, a.port), Handler)
+    server = Server((a.host, port), Handler)
+
+    # Warm the audio stack behind the server rather than in front of it, so the
+    # window opens straight away and fills in when the devices are ready.
+    def warm():
+        try:
+            _audio()
+            print("  audio ready")
+        except BridgeError as exc:
+            print(f"  WARNING: {exc}")
+            print("  The page will still load; capture stays switched off.")
+
+    _audio_state["starting"] = True
+    threading.Thread(target=warm, daemon=True, name="namtrix-audio-warmup").start()
+    url = f"http://{a.host}:{port}"
+    print(f"\n  open  {url}\n  stop  Ctrl-C\n")
+
+    # Quitting from the Dock sends SIGTERM. Without this the app would vanish
+    # from the Dock and keep the port, and the next launch would land on 8766.
+    import signal
+
+    def _stop(*_):
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, _stop)
+        except ValueError:
+            pass
+
+    if not a.no_browser:
+        # Only once the socket is listening, so the browser cannot beat us to it.
+        import webbrowser
+
+        threading.Timer(0.4, lambda: webbrowser.open(url)).start()
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nstopped")
+        pass
+    print("\nstopped")
 
 
 if __name__ == "__main__":

@@ -14,21 +14,37 @@ nothing to connect.
 Without the bridge running, `index.html` behaves exactly like Lite — the capture card never
 appears. Nothing is lost, you just record in a DAW as before.
 
-## Running it
+## Installing it
+
+Download **NAMTRIX-Full-macOS.zip** from the
+[latest release](https://github.com/VoxArtist/namtrix-full/releases), unzip it, and drag
+**NAMTRIX Full.app** to Applications. Nothing else to install — the app carries its own
+Python, numpy and PortAudio.
+
+Double-click it and your browser opens on the tool. Quit it from the Dock when you are done.
+
+Two things to expect the first time:
+
+- **Right-click → Open, not a double-click.** The app is signed, but signing it in a way
+  that satisfies Gatekeeper outright needs a paid Apple Developer account. Right-click →
+  Open once and macOS remembers.
+- **macOS asks for microphone permission**, because it counts any audio input as a
+  microphone. Say yes. Saying no yields *silent recordings rather than an error*, which is
+  a confusing way to lose an hour.
+
+### From source
 
 ```bash
-python bridge/namtrix_bridge.py
+python3 -m pip install numpy sounddevice
+python3 bridge/namtrix_bridge.py
 ```
 
-Then open **http://127.0.0.1:8765**.
+Then open **http://127.0.0.1:8765**. Nothing else is needed: the delay measurement is
+vendored in `bridge/latency.py`, so no trainer checkout and no torch.
 
-Use the trainer's Python (the one with `sounddevice`, `numpy`, `soundfile`) — on this
-machine that is the `nam-venv` from the parametric trainer setup. `start.command` does this
-for you; double-click it.
+### Building the app
 
-**macOS will ask for microphone permission the first time**, because recording counts as
-mic access. Approve Terminal in System Settings → Privacy & Security → Microphone. Skipping
-it yields silent recordings rather than an error, which is a confusing way to lose an hour.
+`build/build_app.sh` makes its own environment, builds the icon, bundles, signs and zips.
 
 ## A run
 
@@ -47,6 +63,25 @@ bridge adds is stripped, **the rig's delay is left in**. That is what a DAW-reco
 looks like, and what the trainer expects alongside an explicit `delay`. Pre-aligning here
 would risk the correction being applied twice — which cost us a full training run once,
 ESR 0.166 instead of 0.012, from an 8-sample over-correction.
+
+## Knob check
+
+After each take, the page reads the recording back and compares it with every run so far.
+Every run plays the same signal, so takes differ only by where the knobs were — which makes
+a run checkable against the others. If one disagrees with what the rest predict, the run
+sheet is a likelier culprit than the amp, and you hear about it **while the amp is still set
+that way**, when re-recording costs one take instead of a training run.
+
+It reports how big an error it can actually see, per knob, and that number is worth reading
+before the findings are. On our own 1987X it lands between 6 and 17 knob units — the amp was
+driven into saturation, so its controls move the sound less than one take differs from the
+next, and nothing can recover what the amp never expressed. On gear whose knobs do more, it
+sees about one unit. Either way it says which it is instead of implying the flattering one.
+
+A suggestion is the closest single-knob explanation, not a verdict. An amp can do things no
+knob accounts for — our run 27 had Volume I at zero, which switches off the High Treble
+channel entirely, and the check reached for Presence because that is the nearest thing in
+its vocabulary. Look at the run before changing anything.
 
 ## Refusals
 

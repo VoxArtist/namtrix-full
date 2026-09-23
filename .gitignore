@@ -1,3 +1,9 @@
-.DS_Store
 __pycache__/
 *.pyc
+.DS_Store
+
+# Build output: the app is published as a release asset, not committed.
+build/dist/
+build/work/
+build/.venv/
+build/namtrix.iconset/
