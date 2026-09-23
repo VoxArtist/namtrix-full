@@ -479,6 +479,26 @@ def list_devices():
 # capture
 # ----------------------------------------------------------------------------
 
+def stream_settings(body, sample_rate):
+    """
+    The buffer the page asked for, as PortAudio wants it.
+
+    A DAW-style buffer size in samples. Asked for alone, PortAudio's "high"
+    latency preset opens buffers of about 20,000 samples here, which puts a
+    quarter of a second between playing and recording: harmless to training,
+    which measures and removes it, but it cuts that much off the end of every
+    take. The round trip measures three buffers: 767 samples at 256.
+    """
+    size = body.get("blockSize")
+    if size:
+        size = int(size)
+        if not 16 <= size <= 8192:
+            raise BridgeError(f"Buffer size {size} is out of range (16 to 8192).")
+        return {"blocksize": size, "latency": size / float(sample_rate)}
+    return {"blocksize": int(body.get("blocksize") or 0),
+            "latency": body.get("latency") or "high"}
+
+
 def play_and_record(playback, *, output_device, input_device, output_channel,
                     sample_rate, blocksize=0, latency="high"):
     """
@@ -647,15 +667,15 @@ def do_capture(body):
         input_device=int(body["inputDevice"]),
         output_channel=int(body["outputChannel"]),
         sample_rate=sample_rate,
-        blocksize=int(body.get("blocksize") or 0),
-        latency=body.get("latency") or "high",
+        **stream_settings(body, sample_rate),
     )
     if _capture_cancel.is_set():
         raise BridgeError("Recording cancelled; nothing was saved.")
     if dropped:
         raise BridgeError(
             "The audio stream dropped samples, so this take is not trustworthy. "
-            "Nothing was saved. Close other audio apps or raise the buffer size."
+            "Nothing was saved. Raise the buffer size (Output, section 2) or close "
+            "other audio apps, then record it again."
         )
 
     results = []
@@ -779,7 +799,7 @@ def do_test_route(body):
         input_device=int(body["inputDevice"]),
         output_channel=int(body["outputChannel"]),
         sample_rate=sample_rate,
-        latency=body.get("latency") or "high",
+        **stream_settings(body, sample_rate),
     )
     wanted = {int(c) for c in (body.get("channels") or [])}
     inputs = []
@@ -799,6 +819,9 @@ def do_test_route(body):
             else:
                 entry["delay"] = int(result.delay)
         inputs.append(entry)
+    if dropped:
+        raise BridgeError("The audio stream dropped samples during the test. Raise the "
+                          "buffer size (Output, section 2) or close other audio apps.")
     return {
         "ok": True,
         "dropped": dropped,

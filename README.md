@@ -81,7 +81,9 @@ from MIT-licensed projects.
 3. **Reamp & record**, in order:
    1. *Capture chains* — the device alone, or an amp and cab with how many mics (each mic is
       a chain), optionally plus the head's direct output.
-   2. *Output* — where the reamp signal goes.
+   2. *Output* — where the reamp signal goes, and the *buffer size* (64–2048 samples, 256 by
+      default), as in a DAW. The delay between playing and recording is three buffers: 767
+      samples (16 ms) at 256. Raise it if a take reports dropped samples.
    3. *Inputs* — one per chain.
    4. *Test the route* — plays timing blips and the loudest moments of the reamp signal
       through the chosen output. Each chain gets its peak level, a gain verdict (*increase*,
