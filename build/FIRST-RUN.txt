@@ -1,0 +1,30 @@
+NAMTRIX Full — read this once
+=============================
+
+1. Drag "NAMTRIX Full.app" to your Applications folder.
+
+2. The first time, RIGHT-CLICK it and choose "Open" — do not double-click.
+   macOS will ask whether you are sure. Say yes.
+
+   A plain double-click will say the developer cannot be verified and refuse.
+   That is not a fault in the app: telling macOS otherwise requires a paid
+   Apple Developer account. Right-click → Open once and it remembers forever.
+
+3. macOS will ask for microphone permission. Say yes.
+
+   It counts any audio input as a microphone, including your interface. If you
+   say no, recordings come back silent instead of giving you an error, which is
+   a confusing way to lose an hour. You can change it later in
+   System Settings → Privacy & Security → Microphone.
+
+That is the whole installation. Nothing else to install — the app carries its
+own Python and audio libraries.
+
+Double-click it and your browser opens on the tool. Quit from the Dock when you
+are done.
+
+If you extract the zip from a terminal, use "ditto -x -k" rather than "unzip":
+unzip does not preserve everything the app's signature covers, and macOS will
+then refuse to run it.
+
+                                        https://github.com/VoxArtist/namtrix-full

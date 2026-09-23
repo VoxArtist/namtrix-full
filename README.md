@@ -27,10 +27,15 @@ Two things to expect the first time:
 
 - **Right-click → Open, not a double-click.** The app is signed, but signing it in a way
   that satisfies Gatekeeper outright needs a paid Apple Developer account. Right-click →
-  Open once and macOS remembers.
+  Open once and macOS remembers. (A plain double-click is refused outright, silently, so
+  this step is not optional. The zip carries the same note beside the app.)
 - **macOS asks for microphone permission**, because it counts any audio input as a
   microphone. Say yes. Saying no yields *silent recordings rather than an error*, which is
   a confusing way to lose an hour.
+
+If you extract the zip from a terminal, use `ditto -x -k` rather than `unzip`: `unzip` does
+not preserve everything the signature covers, and macOS then refuses to run the app with
+"a sealed resource is missing or invalid". Finder's own double-click does the right thing.
 
 ### From source
 

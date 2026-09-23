@@ -32,8 +32,15 @@ codesign --force --deep --sign - "$APP"
 codesign --verify --deep --strict "$APP" && echo "    signature ok"
 
 echo "==> zipping"
-rm -f "build/dist/NAMTRIX-Full-macOS.zip"
-ditto -c -k --keepParent "$APP" "build/dist/NAMTRIX-Full-macOS.zip"
+# The app and a first-run note together, because the one confusing moment -
+# Gatekeeper refusing a plain double-click - happens before anyone reads a
+# README on the web.
+rm -rf build/dist/payload "build/dist/NAMTRIX-Full-macOS.zip"
+mkdir -p build/dist/payload
+ditto "$APP" "build/dist/payload/NAMTRIX Full.app"
+cp build/FIRST-RUN.txt "build/dist/payload/Read me first.txt"
+ditto -c -k --sequesterRsrc "build/dist/payload" "build/dist/NAMTRIX-Full-macOS.zip"
+rm -rf build/dist/payload
 
 du -sh "$APP" "build/dist/NAMTRIX-Full-macOS.zip"
 echo "==> done: $APP"
