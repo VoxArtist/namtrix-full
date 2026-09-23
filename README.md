@@ -1,9 +1,11 @@
 # NAMTRIX Full
 
 Everything [NAMTRIX Lite](https://github.com/VoxArtist/namtrix) does — Latin Hypercube run
-sheets, snapped knob values, holdout sets, ESR validation — **plus recording**. It plays the
-reamp signal, captures every chain at once through a multi-channel interface, and measures
-each chain's round-trip delay from the take itself.
+sheets, snapped knob values, holdout sets — **plus the rest of the job, without a terminal or
+a DAW**: it plays the reamp signal (both signals ship inside the app), records every chain at
+once through a multi-channel interface, measures each chain's latency, checks the takes for
+knob mistakes, trains the model from this session's recordings, and scores it against the
+holdout runs.
 
 ## Why there is a local program
 
@@ -11,8 +13,8 @@ A browser cannot address physical channel 3 of an interface. So a small local pr
 "bridge") owns the audio and serves the page that drives it: same origin, one command,
 nothing to connect.
 
-Without the bridge running, `index.html` behaves exactly like Lite — the capture card never
-appears. Nothing is lost, you just record in a DAW as before.
+Opened as a plain file without the bridge, the page says capture is unavailable; use Lite for
+the DAW-based workflow.
 
 ## Installing it
 
@@ -57,22 +59,44 @@ python3 -m pip install numpy sounddevice
 python3 bridge/namtrix_bridge.py
 ```
 
-Then open **http://127.0.0.1:8765**. Nothing else is needed: the delay measurement is
+Then open **http://127.0.0.1:8765**. Recording needs nothing else: the delay measurement is
 vendored in `bridge/latency.py`, so no trainer checkout and no torch.
+
+The reamp signals in `signals/` are NAM's standard v3.0.0 `input.wav` and the parametric
+trainer's `inputTrunc.wav` / `validation.wav` cut of it (training-inputs-v1 release), both
+from MIT-licensed projects.
 
 ### Building the app
 
 `build/build_app.sh` makes its own environment, builds the icon, bundles, signs and zips.
 
-## A run
+## A session
 
-1. Pick the output device and the channel feeding the reamp box.
-2. Pick the input device, and which input carries each capture chain.
-3. **Test route** plays a short tone and shows the level on every input, so you can confirm
-   the routing before committing to fifty runs.
-4. **Record run** plays the signal, records every chain in one pass, writes one file per
-   chain using your naming pattern, measures each chain's delay and writes it into the
-   chain settings, ticks the run off and shows the next knob positions full screen.
+1. **Parameter space.** Pick a gear preset or enter the controls. *Save as preset* adds your
+   gear to the list under *My presets* (kept by the app, so it survives a restart).
+2. **OED matrix.** Choose run counts and the reamp signal — *Long* (NAM's standard 190 s
+   input) or *Short* (38 s + a 7 s validation cut) — and the time estimate follows.
+3. **Reamp & record**, in order:
+   1. *Capture chains* — the device alone, or an amp and cab with how many mics (each mic is
+      a chain), optionally plus the head's direct output.
+   2. *Output* — where the reamp signal goes.
+   3. *Inputs* — one per chain.
+   4. *Test the route* — plays timing blips and the loudest moments of the reamp signal
+      through the chosen output. Each chain gets its peak level, a gain verdict (*increase*,
+      *decrease* or *good*, against a −18 to −3 dBFS target) and its latency, which is saved
+      to the chain and used for training. Test with the gear at its loudest run-sheet setting.
+   5. *File names* — with examples for a training and a holdout (verification) run.
+   6. *Recordings folder* — chosen in a normal macOS folder dialog.
+   7. *Record* — each run shows its knob settings full screen; dial them, press Record. A
+      take that clips, or comes back silent, is not ticked off.
+   8. *Check the recordings* — see below.
+4. **Train.** Pick epochs (400 by default) and press Start. A folder dialog asks where the
+   model goes; the app writes the dataset from this session's takes — each with its knob
+   settings and its own measured latency — and runs the trainer, showing progress, best ESR
+   so far and time left. The model name defaults to the gear name.
+5. **Validate.** One button. Every holdout run is played through the trained model at its
+   knob settings and compared with the real recording; the average ESR comes back with what
+   it means.
 
 ## What it saves
 
@@ -84,11 +108,12 @@ ESR 0.166 instead of 0.012, from an 8-sample over-correction.
 
 ## Knob check
 
-After each take, the page reads the recording back and compares it with every run so far.
-Every run plays the same signal, so takes differ only by where the knobs were — which makes
-a run checkable against the others. If one disagrees with what the rest predict, the run
-sheet is a likelier culprit than the amp, and you hear about it **while the amp is still set
-that way**, when re-recording costs one take instead of a training run.
+Once every run is recorded, the app offers to check the takes. It reads each one back from
+the recordings folder and compares it with all the others. Every run plays the same signal,
+so takes differ only by where the knobs were — which makes a run checkable against the rest.
+Runs that disagree with what the others predict are listed; **Re-record these runs** queues
+just those, at their own settings, and each new take replaces the old file. When the queue is
+done the check runs again, until it comes back clean or you choose **Ignore**.
 
 It reports how big an error it can actually see, per knob, and that number is worth reading
 before the findings are. On our own 1987X it lands between 6 and 17 knob units — the amp was
@@ -101,6 +126,22 @@ knob accounts for — our run 27 had Volume I at zero, which switches off the Hi
 channel entirely, and the check reached for Presence because that is the nearest thing in
 its vocabulary. Look at the run before changing anything.
 
+## Training and validation need the trainer
+
+The app does not bundle the trainer: it is PyTorch plus the
+[parametric NAM fork](https://github.com/phillipmself/neural-amp-modeler-parametric), about a
+gigabyte. Install that once; the Train step then asks you to locate its `nam-full-parametric`
+program (in the environment's `bin` folder) and remembers it. Recording and the knob check
+work without it.
+
+Training runs in the background with the Mac kept awake; leave the app open. *Stop early*
+still exports the best model so far. Each chain gets its own folder with the configs, a copy
+of the DI, the log and the trainer's timestamped run folder holding
+`<name>_parametric.nam` (for the NAM Parametric Plugin) and `<name>.nam`.
+
+Validation scores the checkpoint the trainer exported and writes each holdout prediction to
+`holdout_renders/` in the run folder, so the numbers can be checked by ear.
+
 ## Refusals
 
 The bridge would rather fail than hand you a bad take:
@@ -110,9 +151,10 @@ The bridge would rather fail than hand you a bad take:
   the whole call is supervised from another thread; once a device wedges, later captures
   fail immediately instead of piling up.
 - **Dropped samples** void the take. Nothing is written.
-- **An existing file** is never overwritten without being asked.
-- **Sample-rate mismatch** between the signal file and the capture stops the run rather than
-  resampling behind your back.
+- **An existing file** is never overwritten without being asked — and every file a run will
+  write is checked before anything plays, so a clash cannot waste half a take.
+- **A re-recorded take** is written beside the old one and swapped in, so there is never a
+  moment with neither on disk.
 
 ## Notes carried over from Lite
 

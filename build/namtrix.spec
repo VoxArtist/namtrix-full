@@ -25,9 +25,13 @@ a = Analysis(
     datas=[
         (str(ROOT / "index.html"), "."),
         (str(ROOT / "favicon.svg"), "."),
+        # The reamp signals, so nobody has to find or point at a DI file.
+        (str(ROOT / "signals"), "signals"),
+        # Run by the trainer's own Python, not ours, so it ships as a plain file.
+        (str(ROOT / "bridge" / "validate_model.py"), "."),
         (str(portaudio), "_sounddevice_data"),
     ],
-    hiddenimports=["latency", "_cffi_backend"],
+    hiddenimports=["latency", "training", "_cffi_backend"],
     hookspath=[],
     runtime_hooks=[],
     # Nothing here wants a GUI toolkit, a plotting library or a test runner, and
@@ -60,8 +64,8 @@ app = BUNDLE(
     info_plist={
         "CFBundleName": "NAMTRIX Full",
         "CFBundleDisplayName": "NAMTRIX Full",
-        "CFBundleShortVersionString": "0.5.1",
-        "CFBundleVersion": "0.5.1",
+        "CFBundleShortVersionString": "0.6.0",
+        "CFBundleVersion": "0.6.0",
         "LSMinimumSystemVersion": "11.0",
         # Without this the microphone prompt never appears and recordings come
         # back as digital silence - an hour lost to something that looks like a

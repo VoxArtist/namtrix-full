@@ -1,0 +1,578 @@
+"""
+Training and validation, driven from the page instead of from Terminal.
+
+The trainer itself is not bundled: it is PyTorch plus the parametric NAM fork,
+a gigabyte of wheels that would dwarf everything else in the app. What the app
+does is find an installed trainer, write the three config files from the
+session the page already holds, run it, and report progress back. Nothing here
+imports torch; the parts that need it run as a child process under the
+trainer's own Python.
+
+The dataset is built from this session's recordings. The old route - a shell
+script with a fixed data.json - trained whatever that file pointed at, which
+was one particular amp's 36 takes regardless of what had just been recorded.
+"""
+
+from __future__ import annotations
+
+import copy
+import datetime as _dt
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+
+class TrainingError(RuntimeError):
+    """Something the user can act on; reported as a clean message."""
+
+
+SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "NAMTRIX"
+CONFIG_FILE = SUPPORT_DIR / "config.json"
+TRAINER_BIN = "nam-full-parametric"
+
+
+# ----------------------------------------------------------------------------
+# settings kept between launches
+# ----------------------------------------------------------------------------
+
+def load_settings() -> dict:
+    try:
+        return json.loads(CONFIG_FILE.read_text())
+    except Exception:  # noqa: BLE001 - a missing or broken file means defaults
+        return {}
+
+
+def save_settings(settings: dict) -> None:
+    SUPPORT_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = CONFIG_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(settings, indent=2))
+    os.replace(tmp, CONFIG_FILE)
+
+
+# ----------------------------------------------------------------------------
+# finding the trainer
+# ----------------------------------------------------------------------------
+
+def _python_beside(trainer: Path) -> Path | None:
+    for name in ("python", "python3"):
+        candidate = trainer.parent / name
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _usable(trainer: Path | None) -> bool:
+    return bool(trainer) and trainer.is_file() and os.access(trainer, os.X_OK) \
+        and _python_beside(trainer) is not None
+
+
+def find_trainer() -> dict:
+    """
+    Where the parametric trainer is, if anywhere.
+
+    A path remembered from an earlier "Locate" wins; then the environment; then
+    PATH. There is no crawl of the disk: guessing at someone's folders is slow
+    and finds the wrong copy as often as the right one.
+    """
+    candidates = []
+    remembered = load_settings().get("trainer")
+    if remembered:
+        candidates.append(("remembered", Path(remembered)))
+    env = os.environ.get("NAMTRIX_TRAINER_BIN")
+    if env:
+        candidates.append(("environment", Path(env)))
+    on_path = shutil.which(TRAINER_BIN)
+    if on_path:
+        candidates.append(("PATH", Path(on_path)))
+    for source, path in candidates:
+        path = path.expanduser()
+        if _usable(path):
+            return {"found": True, "path": str(path), "source": source,
+                    "python": str(_python_beside(path))}
+    return {"found": False, "path": None, "source": None, "python": None}
+
+
+def remember_trainer(path: str) -> dict:
+    trainer = Path(path).expanduser()
+    if trainer.is_dir():
+        # accept the environment folder or its bin/ as well as the program itself
+        for inner in (trainer / TRAINER_BIN, trainer / "bin" / TRAINER_BIN):
+            if inner.exists():
+                trainer = inner
+                break
+    if not _usable(trainer):
+        raise TrainingError(
+            f"{trainer} is not the parametric trainer. Pick the program called "
+            f"'{TRAINER_BIN}' inside the trainer's environment (its bin folder)."
+        )
+    settings = load_settings()
+    settings["trainer"] = str(trainer)
+    save_settings(settings)
+    return find_trainer()
+
+
+# ----------------------------------------------------------------------------
+# config files
+# ----------------------------------------------------------------------------
+
+# The network that has trained well here: HyperWaveNet over the stock
+# channels-8 WaveNet stack, the knobs acting through the hypernetwork.
+_LAYER = {
+    "input_size": 1,
+    "condition_size": 1,
+    "channels": 8,
+    "kernel_sizes": [6] * 14 + [15, 15] + [6] * 7,
+    "dilations": [1, 3, 7, 17, 41, 101, 239, 1, 3, 7, 17, 41, 101, 239, 1, 13,
+                  1, 3, 7, 17, 41, 101, 239],
+    "activation": "LeakyReLU",
+    "gated": False,
+    "head": {"out_channels": 1, "kernel_size": 16, "bias": True},
+}
+
+_LEARNING = {
+    "torch_compile": {"enabled": False, "mode": "reduce-overhead"},
+    "train_dataloader": {"batch_size": 16, "shuffle": True, "pin_memory": False,
+                         "drop_last": True, "num_workers": 0},
+    "val_dataloader": {"batch_size": 16, "pin_memory": False, "num_workers": 0},
+    "trainer": {
+        # "auto" is MPS on Apple silicon and CPU elsewhere, where a hardcoded
+        # "mps" would refuse to start at all.
+        "accelerator": "auto",
+        "devices": 1,
+        "precision": "32-true",
+        "benchmark": False,
+        "max_epochs": 400,
+        "gradient_clip_val": 1.0,
+        "enable_progress_bar": True,
+        "enable_model_summary": True,
+    },
+    "threshold_esr": None,
+    "trainer_fit_kwargs": {},
+}
+
+
+def model_config(knobs: list[dict]) -> dict:
+    params = []
+    for k in knobs:
+        lo, hi = float(k["min"]), float(k["max"])
+        params.append({"name": k["name"], "min": lo, "max": hi,
+                       "default": (lo + hi) / 2.0, "type": "continuous"})
+    return {
+        "net": {
+            "name": "HyperWaveNet",
+            "config": {
+                "layers": [copy.deepcopy(_LAYER)],
+                "head_scale": 0.01,
+                "params": params,
+                "hypernet": {"selector": {"exclude_suffixes": ["_conv.weight"]}},
+            },
+        },
+        "loss": {"val_loss": "esr", "mrstft_weight": 0.0005},
+        "optimizer": {"lr": 0.002, "weight_decay": 3.17e-07},
+        "lr_scheduler": {"class": "ExponentialLR", "kwargs": {"gamma": 0.994}},
+    }
+
+
+def learning_config(epochs: int) -> dict:
+    cfg = copy.deepcopy(_LEARNING)
+    cfg["trainer"]["max_epochs"] = int(epochs)
+    return cfg
+
+
+def data_config(runs: list[dict], preset: str, signals: dict) -> dict:
+    """
+    One entry per recorded run.
+
+    Validation during training is always unseen audio at a trained setting, never
+    a holdout run: the checkpoint kept is the one that scores best on validation,
+    so validating on the holdouts would quietly tune the model to them and leave
+    the separate holdout check nothing honest to measure.
+
+    Standard signal: train on 10 s to the last 9 s of each take, validate on that
+    last 9 s. Short pair: train on inputTrunc.wav, validate on the separately
+    recorded validation.wav take of the same run.
+    """
+    train, validation = [], []
+    for run in runs:
+        base = {"params": {k: float(v) for k, v in run["params"].items()},
+                "delay": int(run.get("delay") or 0)}
+        if preset == "short":
+            train.append({**base, "x_path": signals["short_train"], "y_path": run["y"],
+                          "start_seconds": 0.0, "stop_seconds": None, "ny": 8192})
+            if run.get("yVal"):
+                validation.append({**base, "x_path": signals["short_val"],
+                                   "y_path": run["yVal"], "start_seconds": 0.0,
+                                   "stop_seconds": None, "ny": None,
+                                   "require_input_pre_silence": None})
+        else:
+            train.append({**base, "x_path": signals["v3"], "y_path": run["y"],
+                          "start_seconds": 10.0, "stop_seconds": -9.0, "ny": 8192})
+            validation.append({**base, "x_path": signals["v3"], "y_path": run["y"],
+                               "start_seconds": -9.0, "stop_seconds": None, "ny": None,
+                               "require_input_pre_silence": None})
+    if not train:
+        raise TrainingError("No recorded runs to train on.")
+    if not validation:
+        raise TrainingError("No validation takes were recorded, so training has nothing "
+                            "to check itself against.")
+    return {"type": "parametric", "common": {"delay": 0},
+            "train": train, "validation": validation}
+
+
+# ----------------------------------------------------------------------------
+# metadata: the fields plugins and Tone3000 show, which the trainer leaves empty
+# ----------------------------------------------------------------------------
+
+def _gear_type(chain: str, knob_names: list[str]) -> str:
+    c = (chain or "").lower()
+    if any(w in c for w in ("cab", "mic", "full", "room")):
+        return "amp_cab"
+    names = " ".join(knob_names).lower()
+    if any(w in names for w in ("presence", "master", "volume i", "bright")):
+        return "amp"
+    return "pedal" if knob_names else "amp"
+
+
+def write_metadata(model_path: Path, gear: str, chain: str, parametric: bool,
+                   knob_names: list[str]) -> None:
+    doc = json.loads(model_path.read_text())
+    parts = gear.split()
+    name = gear or model_path.stem
+    if chain:
+        name += f" ({chain})"
+    if parametric:
+        name += " parametric"
+    meta = dict(doc.get("metadata") or {})
+    meta.update({
+        "name": name,
+        "modeled_by": os.environ.get("USER", "") or "unknown",
+        "gear_make": parts[0] if parts else None,
+        "gear_model": " ".join(parts[1:]) or None,
+        "gear_type": _gear_type(chain, knob_names),
+    })
+    doc["metadata"] = meta
+    model_path.write_text(json.dumps(doc))
+
+
+# ----------------------------------------------------------------------------
+# jobs
+# ----------------------------------------------------------------------------
+
+def _safe_name(name: str) -> str:
+    cleaned = re.sub(r'[\\/:*?"<>|]+', "_", (name or "").strip())
+    cleaned = re.sub(r"\.nam$", "", cleaned, flags=re.I).strip(" .")
+    return cleaned or "model"
+
+
+def _child_env() -> dict:
+    cache = SUPPORT_DIR / "cache"
+    env = dict(os.environ)
+    for key, sub in (("MPLCONFIGDIR", "mpl"), ("XDG_CACHE_HOME", "xdg"),
+                     ("HF_HOME", "hf")):
+        path = cache / sub
+        path.mkdir(parents=True, exist_ok=True)
+        env[key] = str(path)
+    env["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+    env["PYTHONUNBUFFERED"] = "1"
+    # PyInstaller leaves these pointing into the bundle; the trainer's Python
+    # would then load our libraries instead of its own.
+    for key in ("PYTHONHOME", "PYTHONPATH", "DYLD_LIBRARY_PATH"):
+        env.pop(key, None)
+    return env
+
+
+_EPOCH = re.compile(r"Epoch (\d+)")
+_ESR = re.compile(r"ESR=([0-9.eE+-]+)")
+_CKPT_EPOCH = re.compile(r"epoch=(\d+)")
+
+
+def epochs_done(run_dir: Path) -> int:
+    """
+    Completed epochs, read off the checkpoints the trainer writes each epoch.
+
+    The console is no use for this: through a pipe the trainer's progress bar
+    draws nothing until the run is over.
+    """
+    latest = -1
+    for ckpt in run_dir.glob("lightning_logs/version_*/checkpoints/*.ckpt"):
+        m = _CKPT_EPOCH.search(ckpt.name)
+        if m:
+            latest = max(latest, int(m.group(1)))
+    return latest + 1
+
+
+def best_checkpoint(run_dir: Path) -> tuple[float | None, Path | None]:
+    best = (None, None)
+    for ckpt in run_dir.glob("lightning_logs/version_*/checkpoints/*.ckpt"):
+        m = _ESR.search(ckpt.name)
+        if not m:
+            continue
+        try:
+            esr = float(m.group(1).rstrip("."))
+        except ValueError:
+            continue
+        if best[0] is None or esr < best[0]:
+            best = (esr, ckpt)
+    return best
+
+
+def adopt_best_checkpoint(run_dir: Path) -> bool:
+    """
+    Export after a stop, from the best checkpoint.
+
+    The trainer means to export the best model when interrupted, but the
+    Lightning it runs on answers Ctrl-C with an immediate exit, so that code
+    never runs. It has already written a ready .nam pair beside every scored
+    checkpoint, though, so the best pair is copied into place instead.
+    """
+    _, ckpt = best_checkpoint(run_dir)
+    if ckpt is None:
+        return False
+    copied = False
+    for suffix in ("", "_parametric"):
+        src = ckpt.with_name(f"{ckpt.stem}{suffix}.nam")
+        if src.exists():
+            shutil.copy2(src, run_dir / f"model{suffix}.nam")
+            copied = copied or suffix == "_parametric"
+    return copied
+
+
+class TrainJob:
+    """One training session: every requested chain, one after another."""
+
+    def __init__(self, request: dict, out_dir: Path, trainer: dict, signals: dict):
+        self.request = request
+        self.out_dir = out_dir
+        self.trainer = trainer
+        self.signals = signals
+        self.state = "running"
+        self.error = None
+        self.chains = [{"name": c["name"], "modelName": _safe_name(c["modelName"]),
+                        "state": "waiting", "epoch": 0, "bestEsr": None,
+                        "runDir": None, "files": [], "log": None}
+                       for c in request["chains"]]
+        self.current = 0
+        self.epochs = int(request.get("epochs") or 400)
+        self.started = time.time()
+        self.finished = None
+        self._proc = None
+        self._stop = False
+        self._tail: list[str] = []
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name="namtrix-train")
+
+    def start(self):
+        self._thread.start()
+
+    def stop(self):
+        """Stop early. The trainer still exports the best model it has so far."""
+        self._stop = True
+        proc = self._proc
+        if proc and proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGINT)
+            except Exception:  # noqa: BLE001
+                proc.send_signal(signal.SIGINT)
+
+    def status(self) -> dict:
+        chain = self.chains[self.current] if self.current < len(self.chains) else None
+        if chain and chain["runDir"] and chain["state"] == "training":
+            run_dir = Path(chain["runDir"])
+            esr, _ = best_checkpoint(run_dir)
+            if esr is not None:
+                chain["bestEsr"] = esr
+            chain["epoch"] = max(chain["epoch"], epochs_done(run_dir))
+        return {
+            "state": self.state,
+            "error": self.error,
+            "outDir": str(self.out_dir),
+            "epochs": self.epochs,
+            "current": self.current,
+            "chains": self.chains,
+            "elapsed": (self.finished or time.time()) - self.started,
+            "tail": self._tail[-12:],
+        }
+
+    # -- worker ------------------------------------------------------------
+
+    def _run(self):
+        try:
+            for i, spec in enumerate(self.request["chains"]):
+                if self._stop:
+                    self.chains[i]["state"] = "skipped"
+                    continue
+                self.current = i
+                self._train_chain(i, spec)
+            self.state = "stopped" if self._stop else "done"
+        except TrainingError as exc:
+            self.state, self.error = "failed", str(exc)
+        except Exception as exc:  # noqa: BLE001 - surfaced to the page
+            self.state, self.error = "failed", f"{type(exc).__name__}: {exc}"
+        finally:
+            self.finished = time.time()
+
+    def _train_chain(self, i: int, spec: dict):
+        info = self.chains[i]
+        info["state"] = "preparing"
+        base = self.out_dir / info["modelName"]
+        config_dir = base / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+
+        preset = self.request.get("preset") or "v3"
+        # The DI goes beside the configs so the folder retrains on its own later,
+        # without depending on where this app happened to live.
+        local_signals = {}
+        for key in (("short_train", "short_val") if preset == "short" else ("v3",)):
+            src = Path(self.signals[key])
+            dst = config_dir / src.name
+            if not dst.exists():
+                shutil.copy2(src, dst)
+            local_signals[key] = str(dst)
+
+        knobs = self.request["knobs"]
+        files = {
+            "data": data_config(spec["runs"], preset, local_signals),
+            "model": model_config(knobs),
+            "learning": learning_config(self.epochs),
+        }
+        for name, payload in files.items():
+            (config_dir / f"{name}.json").write_text(json.dumps(payload, indent=2))
+
+        log_path = base / f"training-{_dt.datetime.now():%Y-%m-%d_%H-%M-%S}.log"
+        info["log"] = str(log_path)
+        before = {p for p in base.iterdir() if p.is_dir()}
+        cmd = ["/usr/bin/caffeinate", "-i", self.trainer["path"],
+               str(config_dir / "data.json"), str(config_dir / "model.json"),
+               str(config_dir / "learning.json"), str(base), "--no-plots"]
+        info["state"] = "training"
+        with open(log_path, "wb") as log:
+            self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                          stderr=subprocess.STDOUT, env=_child_env(),
+                                          start_new_session=True)
+            buf = b""
+            while True:
+                chunk = self._proc.stdout.read1(4096) if hasattr(self._proc.stdout, "read1") \
+                    else self._proc.stdout.read(4096)
+                if not chunk:
+                    break
+                log.write(chunk)
+                log.flush()
+                buf += chunk
+                # progress bars redraw with \r, so either ends a line
+                parts = re.split(rb"[\r\n]", buf)
+                buf = parts.pop()
+                for raw in parts:
+                    line = raw.decode("utf-8", "replace").strip()
+                    if not line:
+                        continue
+                    m = _EPOCH.search(line)
+                    if m:
+                        info["epoch"] = int(m.group(1)) + 1
+                    self._tail.append(line[-240:])
+                    del self._tail[:-40]
+                if info["runDir"] is None:
+                    new = [p for p in base.iterdir() if p.is_dir() and p not in before
+                           and p.name != "config"]
+                    if new:
+                        info["runDir"] = str(new[0])
+            code = self._proc.wait()
+
+        if info["runDir"] is None:
+            new = [p for p in base.iterdir() if p.is_dir() and p not in before
+                   and p.name != "config"]
+            info["runDir"] = str(new[0]) if new else None
+        run_dir = Path(info["runDir"]) if info["runDir"] else None
+        exported = run_dir and (run_dir / "model_parametric.nam").exists()
+        if not exported and self._stop and run_dir:
+            exported = adopt_best_checkpoint(run_dir)
+        if code != 0 and not exported:
+            info["state"] = "failed"
+            tail = "\n".join(self._tail[-6:])
+            raise TrainingError(
+                f"Training {info['name']} stopped with an error. The last lines were:\n{tail}"
+                f"\n\nThe full log is {log_path}."
+            )
+        if not exported:
+            info["state"] = "failed"
+            raise TrainingError(f"Training {info['name']} finished without exporting a model.")
+
+        esr, _ = best_checkpoint(run_dir)
+        info["bestEsr"] = esr
+        info["epoch"] = max(info["epoch"], epochs_done(run_dir))
+        knob_names = [k["name"] for k in knobs]
+        gear = self.request.get("gear") or ""
+        for suffix, parametric in (("_parametric", True), ("", False)):
+            src = run_dir / f"model{suffix}.nam"
+            if not src.exists():
+                continue
+            dst = run_dir / f"{info['modelName']}{suffix}.nam"
+            if src != dst:
+                src.rename(dst)
+            try:
+                write_metadata(dst, gear, info["name"], parametric, knob_names)
+            except Exception:  # noqa: BLE001 - metadata is a nicety, the model is not
+                pass
+            info["files"].append(str(dst))
+        info["state"] = "stopped" if self._stop else "done"
+
+
+class ValidateJob:
+    """Render every holdout run through the trained model and score it."""
+
+    def __init__(self, request: dict, trainer: dict, script: Path, signals: dict):
+        self.request = request
+        self.trainer = trainer
+        self.script = script
+        self.signals = signals
+        self.state = "running"
+        self.error = None
+        self.result = None
+        self.progress = ""
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name="namtrix-validate")
+
+    def start(self):
+        self._thread.start()
+
+    def status(self) -> dict:
+        return {"state": self.state, "error": self.error, "result": self.result,
+                "progress": self.progress}
+
+    def _run(self):
+        work = SUPPORT_DIR / "validate"
+        work.mkdir(parents=True, exist_ok=True)
+        req_path, out_path = work / "request.json", work / "result.json"
+        if out_path.exists():
+            out_path.unlink()
+        preset = self.request.get("preset") or "v3"
+        payload = dict(self.request)
+        payload["x"] = self.signals["short_train" if preset == "short" else "v3"]
+        req_path.write_text(json.dumps(payload))
+        try:
+            proc = subprocess.Popen(
+                [self.trainer["python"], str(self.script), str(req_path), str(out_path)],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=_child_env(),
+            )
+            lines = []
+            for raw in proc.stdout:
+                line = raw.decode("utf-8", "replace").strip()
+                if line:
+                    lines.append(line)
+                    if line.startswith("progress:"):
+                        self.progress = line[len("progress:"):].strip()
+            code = proc.wait()
+            if code != 0 or not out_path.exists():
+                raise TrainingError("Validation failed:\n" + "\n".join(lines[-8:]))
+            self.result = json.loads(out_path.read_text())
+            self.state = "done"
+        except TrainingError as exc:
+            self.state, self.error = "failed", str(exc)
+        except Exception as exc:  # noqa: BLE001
+            self.state, self.error = "failed", f"{type(exc).__name__}: {exc}"

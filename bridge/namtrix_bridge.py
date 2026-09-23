@@ -27,6 +27,7 @@ import argparse
 import json
 import mimetypes
 import os
+import subprocess
 import sys
 import threading
 import time as _time
@@ -41,7 +42,9 @@ from pathlib import Path
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-VERSION = "0.2.0"
+import training  # noqa: E402 - needs the sys.path line above
+
+VERSION = "0.3.0"
 PREAMBLE_PAD_SECONDS = 0.25   # silence after the preamble before the signal starts
 OPEN_TIMEOUT_SECONDS = 10.0   # PortAudio can block indefinitely opening a dead device
 
@@ -49,9 +52,29 @@ OPEN_TIMEOUT_SECONDS = 10.0   # PortAudio can block indefinitely opening a dead 
 # in this process, so say so rather than hanging every later request too.
 _wedged = {"device": False}
 
-# Takes written during this run, which are the only files /api/take will serve.
+# Takes written during this run, and the folders the user chose for recordings.
+# /api/take serves a .wav only from one of these, so a crafted path cannot
+# walk out into the rest of the disk.
 _written_takes: set[str] = set()
+_allowed_dirs: set[str] = set()
 _written_lock = threading.Lock()
+
+# The reamp signals ship inside the app: the person recording should not have to
+# find, download or point at a DI file. Keys are what the page asks for.
+SIGNAL_FILES = {
+    "v3": "input.wav",               # NAM v3.0.0 standard input, 190 s
+    "short_train": "inputTrunc.wav", # truncated v3 for parametric sessions, 38 s
+    "short_val": "validation.wav",   # its separate 7 s validation cut
+}
+
+# Gain advice for the test route, in dBFS peak on the recorded return. Below the
+# window the take wastes converter resolution; above it one hot run clips.
+GAIN_LOW_DBFS = -18.0
+GAIN_HIGH_DBFS = -3.0
+LIVE_DBFS = -60.0
+
+# Only one training or validation job at a time; the GPU is not shareable either.
+_jobs = {"train": None, "validate": None}
 
 
 class BridgeError(RuntimeError):
@@ -79,6 +102,198 @@ def _json_safe(value):
     if isinstance(value, (list, tuple)):
         return [_json_safe(v) for v in value]
     return value
+
+
+def _signals_dir() -> Path:
+    return _bundled_root() / "signals"
+
+
+def signal_path(key: str) -> Path:
+    if key not in SIGNAL_FILES:
+        raise BridgeError(f"Unknown reamp signal '{key}'.")
+    path = _signals_dir() / SIGNAL_FILES[key]
+    if not path.is_file():
+        raise BridgeError(f"The app is missing its reamp signal {path.name}. Reinstall it.")
+    return path
+
+
+def _allow_dir(path) -> None:
+    with _written_lock:
+        _allowed_dirs.add(str(Path(path).expanduser().resolve()))
+
+
+def _may_serve(resolved: str) -> bool:
+    if not resolved.lower().endswith(".wav"):
+        return False
+    with _written_lock:
+        if resolved in _written_takes:
+            return True
+        return any(resolved.startswith(d.rstrip("/") + "/") for d in _allowed_dirs)
+
+
+# ----------------------------------------------------------------------------
+# native dialogs: a web page cannot learn a folder's real path, so the app asks
+# ----------------------------------------------------------------------------
+
+def _applescript_string(text: str) -> str:
+    return '"' + str(text).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _osascript_choose(kind: str, prompt: str, default: str | None = None) -> str | None:
+    """A macOS choose-folder/choose-file dialog. None when cancelled."""
+    # For automated tests only: a native dialog cannot be clicked by a script.
+    canned = os.environ.get("NAMTRIX_DIALOG_ANSWER")
+    if canned is not None:
+        return canned or None
+    where = ""
+    if default and Path(default).expanduser().exists():
+        where = f" default location (POSIX file {_applescript_string(str(Path(default).expanduser()))})"
+    script = (
+        "activate\n"
+        "try\n"
+        f"  return POSIX path of (choose {kind} with prompt {_applescript_string(prompt)}{where})\n"
+        "on error number -128\n"
+        '  return ""\n'
+        "end try"
+    )
+    proc = subprocess.run(["/usr/bin/osascript", "-e", script],
+                          capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise BridgeError(f"The dialog could not open: {proc.stderr.strip()}")
+    chosen = proc.stdout.strip()
+    return chosen.rstrip("/") or None if chosen else None
+
+
+def do_choose_folder(body):
+    chosen = _osascript_choose("folder", body.get("prompt") or "Choose a folder",
+                               body.get("default"))
+    if not chosen:
+        return {"ok": True, "cancelled": True, "path": None}
+    _allow_dir(chosen)
+    return {"ok": True, "cancelled": False, "path": chosen}
+
+
+def do_allow_folder(body):
+    path = Path(body.get("path") or "").expanduser()
+    if not str(body.get("path") or "").strip() or not path.is_dir():
+        return {"ok": True, "allowed": False}
+    _allow_dir(path)
+    return {"ok": True, "allowed": True}
+
+
+def do_reveal(body):
+    path = Path(body.get("path") or "").expanduser()
+    if not path.exists():
+        raise BridgeError(f"{path} no longer exists.")
+    subprocess.run(["/usr/bin/open", "-R", str(path)], check=False)
+    return {"ok": True}
+
+
+# ----------------------------------------------------------------------------
+# user gear presets, kept outside the browser so a new port does not lose them
+# ----------------------------------------------------------------------------
+
+PRESETS_FILE = training.SUPPORT_DIR / "presets.json"
+
+
+def load_presets():
+    try:
+        data = json.loads(PRESETS_FILE.read_text())
+        return data if isinstance(data, list) else []
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def do_save_presets(body):
+    presets = body.get("presets")
+    if not isinstance(presets, list):
+        raise BridgeError("Expected a list of presets.")
+    training.SUPPORT_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = PRESETS_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(presets, indent=2))
+    os.replace(tmp, PRESETS_FILE)
+    return {"ok": True, "presets": presets}
+
+
+# ----------------------------------------------------------------------------
+# training and validation
+# ----------------------------------------------------------------------------
+
+def _signal_paths() -> dict:
+    return {k: str(signal_path(k)) for k in SIGNAL_FILES}
+
+
+def _job_busy():
+    for kind, job in _jobs.items():
+        if job is not None and job.state == "running":
+            return kind
+    return None
+
+
+def do_trainer_locate(body):
+    chosen = _osascript_choose(
+        "file", "Locate the parametric trainer (nam-full-parametric, in its "
+        "environment's bin folder)")
+    if not chosen:
+        return {"ok": True, "cancelled": True, "trainer": training.find_trainer()}
+    try:
+        return {"ok": True, "cancelled": False, "trainer": training.remember_trainer(chosen)}
+    except training.TrainingError as exc:
+        raise BridgeError(str(exc)) from exc
+
+
+def do_train(body):
+    busy = _job_busy()
+    if busy:
+        raise BridgeError(f"A {busy} job is already running.")
+    trainer = training.find_trainer()
+    if not trainer["found"]:
+        raise BridgeError("The parametric trainer was not found. Locate it first.")
+    missing = [r[k] for c in body["chains"] for r in c["runs"] for k in ("y", "yVal")
+               if r.get(k) and not Path(r[k]).expanduser().is_file()]
+    if missing:
+        names = ", ".join(Path(m).name for m in missing[:4])
+        raise BridgeError(
+            f"{len(missing)} recording{'s are' if len(missing) != 1 else ' is'} missing "
+            f"from the recordings folder ({names}{'...' if len(missing) > 4 else ''})."
+        )
+    chosen = _osascript_choose("folder", "Choose where to save the trained model",
+                               body.get("defaultDir"))
+    if not chosen:
+        return {"ok": True, "cancelled": True}
+    job = training.TrainJob(body, Path(chosen), trainer, _signal_paths())
+    _jobs["train"] = job
+    job.start()
+    return {"ok": True, "cancelled": False, "status": job.status()}
+
+
+def do_train_stop(body):
+    job = _jobs["train"]
+    if job is None or job.state != "running":
+        return {"ok": True, "stopped": False}
+    job.stop()
+    return {"ok": True, "stopped": True}
+
+
+def do_validate(body):
+    busy = _job_busy()
+    if busy:
+        raise BridgeError(f"A {busy} job is already running.")
+    trainer = training.find_trainer()
+    if not trainer["found"]:
+        raise BridgeError("Validation runs the model through the trainer, which was not "
+                          "found. Locate it on the training step first.")
+    for chain in body["chains"]:
+        if not Path(chain["runDir"]).is_dir():
+            raise BridgeError(f"The trained model folder for {chain['name']} is gone: "
+                              f"{chain['runDir']}")
+    script = Path(__file__).resolve().parent / "validate_model.py"
+    if not script.exists():
+        script = _bundled_root() / "validate_model.py"
+    job = training.ValidateJob(body, trainer, script, _signal_paths())
+    _jobs["validate"] = job
+    job.start()
+    return {"ok": True, "status": job.status()}
 
 
 # ----------------------------------------------------------------------------
@@ -311,10 +526,7 @@ def do_capture(body):
     mods = _audio()
     np, BlipPreamble, measure_delay = mods["np"], mods["BlipPreamble"], mods["measure_delay"]
 
-    signal_path = Path(body["signalPath"]).expanduser()
-    if not signal_path.is_file():
-        raise BridgeError(f"Signal file not found: {signal_path}")
-    signal, signal_rate = read_wav_mono(signal_path)
+    signal, signal_rate = read_wav_mono(signal_path(body.get("signal") or "v3"))
     sample_rate = int(body.get("sampleRate") or signal_rate)
     if sample_rate != signal_rate:
         raise BridgeError(
@@ -334,6 +546,15 @@ def do_capture(body):
                 "take you have; delete it first or confirm the overwrite."
             )
         targets[chain["name"]] = target
+    # The other files this run will write, checked now so a clash on the second
+    # half of a take is caught before the first half has been played.
+    for name in body.get("alsoCheck") or []:
+        other = out_dir / name
+        if other.exists() and not overwrite:
+            raise BridgeError(
+                f"{other.name} already exists. Re-recording this run would overwrite a "
+                "take you have; delete it first or confirm the overwrite."
+            )
 
     preamble = BlipPreamble(sample_rate=sample_rate)
     playback, signal_start = build_playback(signal, preamble)
@@ -391,7 +612,11 @@ def do_capture(body):
             body_audio = body_audio[:len(signal)]
 
         target = targets[chain["name"]]
-        write_wav_24(target, body_audio, sample_rate)
+        # Written beside the old take and swapped in, so re-recording a run replaces
+        # it in one step: there is never a moment with neither take on disk.
+        partial = target.with_name(f".{target.name}.partial")
+        write_wav_24(partial, body_audio, sample_rate)
+        os.replace(partial, target)
         with _written_lock:
             _written_takes.add(str(target.resolve()))
         results.append({
@@ -406,6 +631,7 @@ def do_capture(body):
             "clipped": bool(np.max(np.abs(body_audio)) >= 0.999) if len(body_audio) else False,
         })
 
+    _allow_dir(out_dir)
     return {
         "ok": True,
         "sampleRate": sample_rate,
@@ -414,38 +640,87 @@ def do_capture(body):
     }
 
 
-def do_test_route(body):
-    """Play a short tone and report what each input heard, before a real run."""
-    mods = _audio()
-    np = mods["np"]
-    sample_rate = int(body.get("sampleRate") or 48000)
-    seconds = float(body.get("seconds") or 1.5)
-    freq = float(body.get("frequency") or 440.0)
-    amplitude = float(body.get("amplitude") or 0.2)
-
-    t = np.arange(int(seconds * sample_rate)) / sample_rate
-    tone = (amplitude * np.sin(2 * np.pi * freq * t)).astype(np.float32)
-    fade = min(int(0.01 * sample_rate), len(tone) // 2)
-    if fade:
+def _loudest_excerpt(signal, rate, seconds=1.5):
+    """
+    The part of the reamp signal that will hit the converters hardest: a window
+    around its biggest peak and another around its loudest stretch. Levels read
+    from these are the levels the real runs will produce, which a sine at some
+    arbitrary amplitude cannot promise.
+    """
+    np = _audio()["np"]
+    n = int(seconds * rate)
+    if len(signal) <= 2 * n:
+        return signal.astype(np.float32)
+    peak_at = int(np.argmax(np.abs(signal)))
+    energy = np.cumsum(np.square(signal.astype(np.float64)))
+    loud_at = int(np.argmax(energy[n:] - energy[:-n]))
+    pieces = []
+    for start in sorted({max(0, min(len(signal) - n, peak_at - n // 2)), loud_at}):
+        piece = signal[start:start + n].astype(np.float32).copy()
+        fade = int(0.01 * rate)
         ramp = np.linspace(0, 1, fade, dtype=np.float32)
-        tone[:fade] *= ramp
-        tone[-fade:] *= ramp[::-1]
+        piece[:fade] *= ramp
+        piece[-fade:] *= ramp[::-1]
+        pieces.append(piece)
+    return np.concatenate(pieces)
+
+
+def gain_advice(peak):
+    if peak is None or peak == float("-inf") or peak < LIVE_DBFS:
+        return "none"
+    if peak >= GAIN_HIGH_DBFS:
+        return "decrease"
+    if peak < GAIN_LOW_DBFS:
+        return "increase"
+    return "ok"
+
+
+def do_test_route(body):
+    """
+    Play timing blips and the loudest moments of the reamp signal out of the
+    chosen output, then report for each input what came back: its level, what
+    to do with the gain, and - for the inputs a chain uses - the round-trip
+    delay, measured the same way a capture measures it.
+    """
+    mods = _audio()
+    np, BlipPreamble, measure_delay = mods["np"], mods["BlipPreamble"], mods["measure_delay"]
+    signal, sample_rate = read_wav_mono(signal_path(body.get("signal") or "v3"))
+    excerpt = _loudest_excerpt(signal, sample_rate)
+    preamble = BlipPreamble(sample_rate=sample_rate)
+    playback, signal_start = build_playback(excerpt, preamble)
 
     recording, dropped, in_channels = play_and_record(
-        tone,
+        playback,
         output_device=int(body["outputDevice"]),
         input_device=int(body["inputDevice"]),
         output_channel=int(body["outputChannel"]),
         sample_rate=sample_rate,
         latency=body.get("latency") or "high",
     )
+    wanted = {int(c) for c in (body.get("channels") or [])}
+    inputs = []
+    for c in range(in_channels):
+        channel = c + 1
+        captured = recording[:, c].copy()
+        heard = captured[signal_start:]
+        peak = peak_dbfs(heard)
+        entry = {"channel": channel, "rms": dbfs(heard), "peak": peak,
+                 "advice": gain_advice(peak), "delay": None, "delayNote": None}
+        if channel in wanted:
+            result = measure_delay(captured, preamble)
+            if result.delay is None:
+                entry["delayNote"] = "No response to the timing blips."
+            elif result.disagreement_too_high:
+                entry["delayNote"] = "The two timing blips disagree; test again."
+            else:
+                entry["delay"] = int(result.delay)
+        inputs.append(entry)
     return {
         "ok": True,
         "dropped": dropped,
-        "inputs": [
-            {"channel": c + 1, "rms": dbfs(recording[:, c]), "peak": peak_dbfs(recording[:, c])}
-            for c in range(in_channels)
-        ],
+        "sampleRate": sample_rate,
+        "target": {"low": GAIN_LOW_DBFS, "high": GAIN_HIGH_DBFS},
+        "inputs": inputs,
     }
 
 
@@ -502,6 +777,19 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._json({"ok": False, "error": str(exc)}, 503)
         if self.path.startswith("/api/take"):
             return self._serve_take()
+        if self.path.startswith("/api/signals"):
+            return self._json({"ok": True, "signals": {
+                k: (_signals_dir() / f).is_file() for k, f in SIGNAL_FILES.items()}})
+        if self.path.startswith("/api/presets"):
+            return self._json({"ok": True, "presets": load_presets()})
+        if self.path.startswith("/api/trainer"):
+            return self._json({"ok": True, "trainer": training.find_trainer()})
+        if self.path.startswith("/api/train/status"):
+            job = _jobs["train"]
+            return self._json({"ok": True, "status": job.status() if job else None})
+        if self.path.startswith("/api/validate/status"):
+            job = _jobs["validate"]
+            return self._json({"ok": True, "status": job.status() if job else None})
         if self.path.startswith("/api/quit"):
             self._json({"ok": True})
             threading.Timer(0.3, lambda: os._exit(0)).start()
@@ -523,9 +811,7 @@ class Handler(SimpleHTTPRequestHandler):
 
         wanted = (parse_qs(urlparse(self.path).query).get("file") or [""])[0]
         resolved = str(Path(wanted).expanduser().resolve()) if wanted else ""
-        with _written_lock:
-            allowed = resolved in _written_takes
-        if not allowed or not Path(resolved).is_file():
+        if not resolved or not _may_serve(resolved) or not Path(resolved).is_file():
             return self._json(
                 {"ok": False, "error": "Not a take this bridge recorded."}, 404
             )
@@ -537,10 +823,28 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    AUDIO_ROUTES = {"/api/capture": do_capture, "/api/test-route": do_test_route}
+    OTHER_ROUTES = {
+        "/api/choose-folder": do_choose_folder,
+        "/api/allow-folder": do_allow_folder,
+        "/api/reveal": do_reveal,
+        "/api/presets": do_save_presets,
+        "/api/trainer/locate": do_trainer_locate,
+        "/api/train/stop": do_train_stop,
+        "/api/train": do_train,
+        "/api/validate": do_validate,
+    }
+
     def do_POST(self):
-        routes = {"/api/capture": do_capture, "/api/test-route": do_test_route}
-        route = next((r for r in routes if self.path.startswith(r)), None)
-        if route is None:
+        # A JSON content type cannot be sent cross-origin without a preflight,
+        # which this server never approves - so another web page open in the
+        # same browser cannot drive the interface or the trainer.
+        if "application/json" not in (self.headers.get("Content-Type") or ""):
+            return self._json({"ok": False, "error": "Expected JSON."}, 415)
+        path = self.path.split("?", 1)[0]
+        audio = path in self.AUDIO_ROUTES
+        handler = self.AUDIO_ROUTES.get(path) or self.OTHER_ROUTES.get(path)
+        if handler is None:
             return self._json({"ok": False, "error": "No such endpoint"}, 404)
         try:
             length = int(self.headers.get("Content-Length") or 0)
@@ -548,19 +852,20 @@ class Handler(SimpleHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001
             return self._json({"ok": False, "error": f"Bad request: {exc}"}, 400)
 
-        if not self._lock.acquire(blocking=False):
+        if audio and not self._lock.acquire(blocking=False):
             return self._json(
                 {"ok": False, "error": "A capture is already running."}, 409
             )
         try:
-            return self._json(routes[route](body))
-        except BridgeError as exc:
+            return self._json(handler(body))
+        except (BridgeError, training.TrainingError) as exc:
             return self._json({"ok": False, "error": str(exc)}, 400)
         except Exception as exc:  # noqa: BLE001
             traceback.print_exc()
             return self._json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, 500)
         finally:
-            self._lock.release()
+            if audio:
+                self._lock.release()
 
 
 class Server(ThreadingHTTPServer):
