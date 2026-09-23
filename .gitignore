@@ -7,3 +7,4 @@ build/dist/
 build/work/
 build/.venv/
 build/namtrix.iconset/
+build/uv

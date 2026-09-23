@@ -21,7 +21,6 @@ portaudio = Path(_sd.__file__).parent / "_sounddevice_data"
 a = Analysis(
     [str(ROOT / "bridge" / "namtrix_bridge.py")],
     pathex=[str(ROOT / "bridge")],
-    binaries=[],
     datas=[
         (str(ROOT / "index.html"), "."),
         (str(ROOT / "favicon.svg"), "."),
@@ -29,7 +28,12 @@ a = Analysis(
         (str(ROOT / "signals"), "signals"),
         # Run by the trainer's own Python, not ours, so it ships as a plain file.
         (str(ROOT / "bridge" / "validate_model.py"), "."),
+        # What "Install trainer" puts on the Mac, and the tool that puts it there.
+        (str(ROOT / "bridge" / "trainer-requirements.txt"), "."),
         (str(portaudio), "_sounddevice_data"),
+    ],
+    binaries=[
+        (str(ROOT / "build" / "uv"), "."),
     ],
     hiddenimports=["latency", "training", "_cffi_backend"],
     hookspath=[],
@@ -64,8 +68,8 @@ app = BUNDLE(
     info_plist={
         "CFBundleName": "NAMTRIX Full",
         "CFBundleDisplayName": "NAMTRIX Full",
-        "CFBundleShortVersionString": "0.6.0",
-        "CFBundleVersion": "0.6.0",
+        "CFBundleShortVersionString": "0.7.0",
+        "CFBundleVersion": "0.7.0",
         "LSMinimumSystemVersion": "11.0",
         # Without this the microphone prompt never appears and recordings come
         # back as digital silence - an hour lost to something that looks like a

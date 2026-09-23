@@ -74,7 +74,7 @@ GAIN_HIGH_DBFS = -3.0
 LIVE_DBFS = -60.0
 
 # Only one training or validation job at a time; the GPU is not shareable either.
-_jobs = {"train": None, "validate": None}
+_jobs = {"train": None, "validate": None, "install": None}
 
 
 class BridgeError(RuntimeError):
@@ -235,11 +235,62 @@ def do_trainer_locate(body):
         "file", "Locate the parametric trainer (nam-full-parametric, in its "
         "environment's bin folder)")
     if not chosen:
-        return {"ok": True, "cancelled": True, "trainer": training.find_trainer()}
+        return {"ok": True, "cancelled": True, "trainer": trainer_status()}
     try:
-        return {"ok": True, "cancelled": False, "trainer": training.remember_trainer(chosen)}
+        training.remember_trainer(chosen)
+        return {"ok": True, "cancelled": False, "trainer": trainer_status()}
     except training.TrainingError as exc:
         raise BridgeError(str(exc)) from exc
+
+
+def _bundled_file(name: str) -> Path | None:
+    """A file shipped beside the bridge: in the checkout, or inside the app."""
+    for base in (Path(__file__).resolve().parent, _bundled_root()):
+        if (base / name).exists():
+            return base / name
+    return None
+
+
+def trainer_status() -> dict:
+    job = _jobs["install"]
+    return {**training.find_trainer(),
+            "install": job.status() if job else None,
+            "canInstall": _uv_source() is not None}
+
+
+def _uv_source() -> Path | None:
+    shipped = _bundled_file("uv")
+    if shipped:
+        return shipped
+    env = os.environ.get("NAMTRIX_UV")
+    if env and Path(env).exists():
+        return Path(env)
+    import shutil as _shutil
+
+    found = _shutil.which("uv")
+    return Path(found) if found else None
+
+
+def do_trainer_install(body):
+    job = _jobs["install"]
+    if job is not None and job.state == "running":
+        return {"ok": True, "trainer": trainer_status()}
+    uv = _uv_source()
+    requirements = _bundled_file("trainer-requirements.txt")
+    if uv is None or requirements is None:
+        raise BridgeError("This copy of NAMTRIX cannot install the trainer (its installer "
+                          "is missing). Reinstall the app, or locate an existing trainer.")
+    job = training.InstallJob(uv, requirements)
+    _jobs["install"] = job
+    job.start()
+    return {"ok": True, "trainer": trainer_status()}
+
+
+def do_trainer_install_cancel(body):
+    job = _jobs["install"]
+    if job is not None and job.state == "running":
+        job.cancel()
+    return {"ok": True}
 
 
 def do_train(body):
@@ -287,10 +338,7 @@ def do_validate(body):
         if not Path(chain["runDir"]).is_dir():
             raise BridgeError(f"The trained model folder for {chain['name']} is gone: "
                               f"{chain['runDir']}")
-    script = Path(__file__).resolve().parent / "validate_model.py"
-    if not script.exists():
-        script = _bundled_root() / "validate_model.py"
-    job = training.ValidateJob(body, trainer, script, _signal_paths())
+    job = training.ValidateJob(body, trainer, _bundled_file("validate_model.py"), _signal_paths())
     _jobs["validate"] = job
     job.start()
     return {"ok": True, "status": job.status()}
@@ -783,7 +831,7 @@ class Handler(SimpleHTTPRequestHandler):
         if self.path.startswith("/api/presets"):
             return self._json({"ok": True, "presets": load_presets()})
         if self.path.startswith("/api/trainer"):
-            return self._json({"ok": True, "trainer": training.find_trainer()})
+            return self._json({"ok": True, "trainer": trainer_status()})
         if self.path.startswith("/api/train/status"):
             job = _jobs["train"]
             return self._json({"ok": True, "status": job.status() if job else None})
@@ -830,6 +878,8 @@ class Handler(SimpleHTTPRequestHandler):
         "/api/reveal": do_reveal,
         "/api/presets": do_save_presets,
         "/api/trainer/locate": do_trainer_locate,
+        "/api/trainer/install": do_trainer_install,
+        "/api/trainer/install/cancel": do_trainer_install_cancel,
         "/api/train/stop": do_train_stop,
         "/api/train": do_train,
         "/api/validate": do_validate,

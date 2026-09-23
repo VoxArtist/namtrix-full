@@ -13,6 +13,16 @@ if [[ ! -x "$VENV/bin/python" ]]; then
   "$VENV/bin/pip" install --quiet numpy sounddevice pyinstaller pillow
 fi
 
+# uv installs the trainer on the user's Mac when they ask for it. It ships
+# inside the app, pinned, so what gets installed does not depend on whatever
+# uv happens to be current on release day.
+UV_VERSION="0.11.1"
+if [[ ! -x build/uv ]] || [[ "$(build/uv --version 2>/dev/null | awk '{print $2}')" != "$UV_VERSION" ]]; then
+  echo "==> fetching uv $UV_VERSION"
+  curl -fsSL "https://github.com/astral-sh/uv/releases/download/$UV_VERSION/uv-aarch64-apple-darwin.tar.gz" \
+    | tar -xz -C build --strip-components=1 uv-aarch64-apple-darwin/uv
+fi
+
 echo "==> icon"
 "$VENV/bin/python" build/make_icon.py
 

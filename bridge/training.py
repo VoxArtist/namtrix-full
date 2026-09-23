@@ -33,9 +33,21 @@ class TrainingError(RuntimeError):
     """Something the user can act on; reported as a clean message."""
 
 
-SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "NAMTRIX"
+# NAMTRIX_SUPPORT_DIR exists for tests, so an install can be exercised without
+# touching the real one.
+SUPPORT_DIR = Path(os.environ.get("NAMTRIX_SUPPORT_DIR")
+                   or Path.home() / "Library" / "Application Support" / "NAMTRIX")
 CONFIG_FILE = SUPPORT_DIR / "config.json"
 TRAINER_BIN = "nam-full-parametric"
+
+# The trainer NAMTRIX installs for itself, when asked to.
+MANAGED_DIR = SUPPORT_DIR / "trainer"
+MANAGED_BIN = MANAGED_DIR / "venv" / "bin" / TRAINER_BIN
+MANAGED_READY = MANAGED_DIR / "READY"
+TRAINER_PYTHON = "3.12.13"
+# The trainer's packaging reads its version from git, which a source archive
+# does not have. This is the version the same commit reports from a checkout.
+TRAINER_VERSION = "0.1.dev1"
 
 
 # ----------------------------------------------------------------------------
@@ -85,6 +97,10 @@ def find_trainer() -> dict:
     remembered = load_settings().get("trainer")
     if remembered:
         candidates.append(("remembered", Path(remembered)))
+    # Only once the install finished: a half-installed environment has the
+    # program in place long before it can run.
+    if MANAGED_READY.exists():
+        candidates.append(("installed", MANAGED_BIN))
     env = os.environ.get("NAMTRIX_TRAINER_BIN")
     if env:
         candidates.append(("environment", Path(env)))
@@ -521,6 +537,149 @@ class TrainJob:
                 pass
             info["files"].append(str(dst))
         info["state"] = "stopped" if self._stop else "done"
+
+
+class InstallJob:
+    """
+    Install the trainer into NAMTRIX's own folder, with uv.
+
+    uv fetches its own Python, then the pinned packages and the trainer itself
+    from its repository, so nothing needs to be on the Mac beforehand and
+    nothing outside this folder is touched. Deleting the folder removes it.
+    """
+
+    PHASES = ["Getting ready", "Downloading Python", "Downloading PyTorch and the trainer",
+              "Checking the install"]
+
+    def __init__(self, uv_source: Path, requirements: Path):
+        self.uv_source = uv_source
+        self.requirements = requirements
+        self.state = "running"
+        self.error = None
+        self.phase = 0
+        self.detail = ""
+        self.downloads = []
+        self.started = time.time()
+        self.finished = None
+        self._proc = None
+        self._cancel = False
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name="namtrix-install")
+
+    def start(self):
+        self._thread.start()
+
+    def cancel(self):
+        self._cancel = True
+        proc = self._proc
+        if proc and proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except Exception:  # noqa: BLE001
+                proc.terminate()
+
+    def status(self) -> dict:
+        return {
+            "state": self.state, "error": self.error,
+            "phase": self.phase, "phases": self.PHASES,
+            "phaseLabel": self.PHASES[min(self.phase, len(self.PHASES) - 1)],
+            "detail": self.detail, "downloads": self.downloads[-6:],
+            "elapsed": (self.finished or time.time()) - self.started,
+        }
+
+    def _step(self, cmd, env):
+        if self._cancel:
+            raise TrainingError("Cancelled.")
+        self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                      env=env, start_new_session=True)
+        lines = []
+        for raw in self._proc.stdout:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line:
+                continue
+            lines.append(line)
+            m = re.match(r"Downloading (\S+) \(([^)]+)\)", line)
+            if m:
+                self.downloads.append(f"{m.group(1)} ({m.group(2)})")
+            self.detail = line[-160:]
+        code = self._proc.wait()
+        if self._cancel:
+            raise TrainingError("Cancelled.")
+        if code != 0:
+            raise TrainingError("\n".join(lines[-8:]) or f"exit code {code}")
+        return lines
+
+    def _run(self):
+        try:
+            import platform
+
+            if sys.platform != "darwin" or platform.machine() != "arm64":
+                raise TrainingError("The automatic install is for Apple silicon Macs (M1 and later).")
+            SUPPORT_DIR.mkdir(parents=True, exist_ok=True)
+            free = shutil.disk_usage(SUPPORT_DIR).free
+            if free < 4 * 1024 ** 3:
+                raise TrainingError(
+                    f"The install needs about 4 GB free while it runs (1.2 GB once done); "
+                    f"this disk has {free / 1024 ** 3:.1f} GB."
+                )
+
+            # uv runs from our own folder, not from inside the app: a helper
+            # program inside a downloaded app still carries the download's
+            # quarantine flag, and macOS would stop it with a dialog of its own.
+            bin_dir = SUPPORT_DIR / "bin"
+            bin_dir.mkdir(parents=True, exist_ok=True)
+            uv = bin_dir / "uv"
+            shutil.copy2(self.uv_source, uv)
+            uv.chmod(0o755)
+            subprocess.run(["/usr/bin/xattr", "-d", "com.apple.quarantine", str(uv)],
+                           capture_output=True)
+
+            if MANAGED_DIR.exists():
+                shutil.rmtree(MANAGED_DIR)
+            MANAGED_DIR.mkdir(parents=True)
+            env = _child_env()
+            env.update({
+                "UV_PYTHON_INSTALL_DIR": str(MANAGED_DIR / "python"),
+                "UV_CACHE_DIR": str(MANAGED_DIR / "cache"),
+                "UV_PYTHON_PREFERENCE": "only-managed",
+                "UV_NO_CONFIG": "1",
+                "NO_COLOR": "1",
+                "SETUPTOOLS_SCM_PRETEND_VERSION": TRAINER_VERSION,
+            })
+            venv = MANAGED_DIR / "venv"
+
+            self.phase = 1
+            self._step([str(uv), "venv", str(venv), "--python", TRAINER_PYTHON], env)
+            self.phase = 2
+            self._step([str(uv), "pip", "install", "--python", str(venv / "bin" / "python"),
+                        "-r", str(self.requirements)], env)
+            self.phase = 3
+            self._step([str(venv / "bin" / "python"), "-c",
+                        "import torch, nam.train.parametric, nam.models.parametric; "
+                        "print('torch', torch.__version__, 'mps', torch.backends.mps.is_available())"],
+                       env)
+            if not MANAGED_BIN.exists():
+                raise TrainingError(f"The install finished without {TRAINER_BIN}.")
+            # The download cache is as big again as the install and never read twice.
+            shutil.rmtree(MANAGED_DIR / "cache", ignore_errors=True)
+            MANAGED_READY.write_text(json.dumps({"python": TRAINER_PYTHON,
+                                                 "installed": time.time()}))
+            self.state = "done"
+        except TrainingError as exc:
+            self.state = "cancelled" if self._cancel else "failed"
+            self.error = str(exc)
+            self._cleanup()
+        except Exception as exc:  # noqa: BLE001
+            self.state = "failed"
+            self.error = f"{type(exc).__name__}: {exc}"
+            self._cleanup()
+        finally:
+            self.finished = time.time()
+
+    def _cleanup(self):
+        # Half an environment is worse than none: find_trainer would never see
+        # it (no READY file), but it would sit there taking a gigabyte.
+        shutil.rmtree(MANAGED_DIR, ignore_errors=True)
 
 
 class ValidateJob:

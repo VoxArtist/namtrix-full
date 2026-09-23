@@ -126,13 +126,22 @@ knob accounts for — our run 27 had Volume I at zero, which switches off the Hi
 channel entirely, and the check reached for Presence because that is the nearest thing in
 its vocabulary. Look at the run before changing anything.
 
-## Training and validation need the trainer
+## The trainer
 
-The app does not bundle the trainer: it is PyTorch plus the
-[parametric NAM fork](https://github.com/phillipmself/neural-amp-modeler-parametric), about a
-gigabyte. Install that once; the Train step then asks you to locate its `nam-full-parametric`
-program (in the environment's `bin` folder) and remembers it. Recording and the knob check
-work without it.
+Training and validation run the
+[parametric NAM trainer](https://github.com/phillipmself/neural-amp-modeler-parametric)
+(PyTorch plus the trainer, about 1 GB). It is not inside the app — every update would
+re-download that gigabyte — but the app installs it for you: from the OED Matrix step on, if
+it is missing, a card offers **Download and install the trainer**. It installs in the
+background into `~/Library/Application Support/NAMTRIX/trainer` while you carry on with the
+matrix and the recordings; the header shows its progress. Nothing outside that folder is
+touched, and deleting the folder removes it.
+
+Under the hood the app carries [uv](https://github.com/astral-sh/uv), which fetches its own
+Python 3.12 and the exact package set in `bridge/trainer-requirements.txt` — the one that has
+trained real models here — with the trainer pinned to a fixed commit. Apple silicon only,
+like the app itself. Anyone who already has a trainer can point the app at it instead
+(*I already have one — locate it*); recording and the knob check need none of this.
 
 Training runs in the background with the Mac kept awake; leave the app open. *Stop early*
 still exports the best model so far. Each chain gets its own folder with the configs, a copy

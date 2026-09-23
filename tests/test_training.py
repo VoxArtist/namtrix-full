@@ -118,6 +118,32 @@ with tempfile.TemporaryDirectory() as tmp:
     check("metadata: a mic chain is amp_cab", meta["gear_type"] == "amp_cab")
     check("metadata: existing fields kept", meta["date"] == 1)
 
+# --- the trainer NAMTRIX installs counts only once the install finished ---
+with tempfile.TemporaryDirectory() as tmp:
+    root = Path(tmp)
+    saved = (training.CONFIG_FILE, training.MANAGED_BIN, training.MANAGED_READY)
+    training.CONFIG_FILE = root / "config.json"            # nothing remembered
+    training.MANAGED_BIN = root / "trainer/venv/bin/nam-full-parametric"
+    training.MANAGED_READY = root / "trainer/READY"
+    try:
+        training.MANAGED_BIN.parent.mkdir(parents=True)
+        for name in ("nam-full-parametric", "python"):
+            f = training.MANAGED_BIN.parent / name
+            f.write_text("#!/bin/sh\n")
+            f.chmod(0o755)
+        import os as _os
+        path_before = _os.environ.get("PATH", "")
+        _os.environ["PATH"] = "/usr/bin:/bin"                # no trainer on PATH
+        _os.environ.pop("NAMTRIX_TRAINER_BIN", None)
+        check("half-installed trainer is not offered", training.find_trainer()["found"] is False)
+        training.MANAGED_READY.write_text("{}")
+        t = training.find_trainer()
+        check("finished install is found", t["found"] and t["source"] == "installed")
+        check("its own python is used", t["python"].endswith("trainer/venv/bin/python"))
+        _os.environ["PATH"] = path_before
+    finally:
+        training.CONFIG_FILE, training.MANAGED_BIN, training.MANAGED_READY = saved
+
 print()
 print("all passed" if not failures else f"{failures} failed")
 sys.exit(1 if failures else 0)
