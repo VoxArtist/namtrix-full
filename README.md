@@ -29,6 +29,19 @@ Two things to expect the first time:
   that satisfies Gatekeeper outright needs a paid Apple Developer account. Right-click →
   Open once and macOS remembers. (A plain double-click is refused outright, silently, so
   this step is not optional. The zip carries the same note beside the app.)
+
+  **If right-click → Open still refuses**, some macOS versions need the longer route:
+  1. Try to open the app once (either way) — it will refuse, and that refusal is what
+     unlocks the next step.
+  2. **System Settings → Privacy & Security**, scroll down to the Security section near
+     the bottom.
+  3. You'll see *"NAMTRIX Full" was blocked to protect your Mac* with an **Open Anyway**
+     button next to it. Click it.
+  4. Confirm with your password or Touch ID if asked.
+  5. Open the app again — one more confirmation dialog, then it runs from then on.
+
+  This isn't a NAMTRIX-specific problem — every unsigned or ad-hoc-signed app hits it,
+  and it's the same $99/year Apple Developer account that would remove it entirely.
 - **macOS asks for microphone permission**, because it counts any audio input as a
   microphone. Say yes. Saying no yields *silent recordings rather than an error*, which is
   a confusing way to lose an hour.

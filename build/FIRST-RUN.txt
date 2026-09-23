@@ -6,9 +6,29 @@ NAMTRIX Full — read this once
 2. The first time, RIGHT-CLICK it and choose "Open" — do not double-click.
    macOS will ask whether you are sure. Say yes.
 
-   A plain double-click will say the developer cannot be verified and refuse.
-   That is not a fault in the app: telling macOS otherwise requires a paid
-   Apple Developer account. Right-click → Open once and it remembers forever.
+   On some versions of macOS this is enough. On others, right-click → Open
+   still refuses and just shows the same "cannot be opened" message a plain
+   double-click would. If that happens, use the System Settings route below —
+   it always works.
+
+   IF RIGHT-CLICK → OPEN DOESN'T WORK:
+
+     a. Try to open the app once (double-click, or right-click → Open).
+        It will refuse. That refusal is expected — it's what unlocks the
+        next step.
+     b. Open System Settings → Privacy & Security.
+     c. Scroll down to the Security section near the bottom of the page.
+        You'll see a line like:
+            "NAMTRIX Full" was blocked to protect your Mac.
+     d. Click "Open Anyway" next to it.
+     e. You may be asked for your Mac password or Touch ID. Confirm.
+     f. Open the app again (double-click is fine now). One more dialog
+        asks you to confirm — click "Open".
+
+   None of this means the app is unsafe. It means the app isn't notarized by
+   Apple, which requires a paid Apple Developer account ($99/year). Every
+   unsigned or ad-hoc-signed app hits this same wall — it's not specific to
+   NAMTRIX. You only do this once per Mac; macOS remembers after that.
 
 3. macOS will ask for microphone permission. Say yes.
 
