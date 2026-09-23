@@ -98,5 +98,48 @@ if trainer and Path(trainer).is_dir():
 else:
     print("\n  (set NAMTRIX_TRAINER to also compare against the trainer's own code)")
 
+
+print("\nJSON safety: a silent channel must not break the response")
+# dbfs() and peak_dbfs() return float('-inf') for a channel that is truly
+# silent - unpatched, wrong device, nothing connected - which is a normal
+# reading, not a fault. Python's own json.dumps writes -inf as the bare token
+# -Infinity, which its own reader (json.loads) happily accepts back but a
+# browser's JSON.parse rejects outright: the fetch that actually succeeded
+# then looks like a failure, and the page reports "Bridge returned 200"
+# instead of the silence reading it was sent.
+import json  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "bridge"))
+import namtrix_bridge as bridge  # noqa: E402
+
+sanitized = bridge._json_safe({
+    "ok": True,
+    "rms": float("-inf"), "peak": float("-inf"),
+    "nested": {"a": float("nan"), "b": [1.0, float("inf"), -2.5]},
+})
+check("non-finite floats become null", sanitized["rms"] is None and sanitized["peak"] is None)
+check("nan inside a nested dict becomes null", sanitized["nested"]["a"] is None)
+check("inf inside a list becomes null, finite values untouched",
+      sanitized["nested"]["b"] == [1.0, None, -2.5])
+
+# Round-tripped exactly as the HTTP layer sends it, unsanitized -inf breaks
+# strict JSON (json.loads(parse_constant=...) still accepts the token by
+# default, so the check has to actually forbid it - the same way a browser
+# does - or this test proves nothing).
+raw_unsanitized = json.dumps({"rms": float("-inf")})
+try:
+    json.loads(raw_unsanitized, parse_constant=lambda tok: (_ for _ in ()).throw(ValueError(tok)))
+    check("unsanitized -Infinity is rejected by a strict reader", False)
+except ValueError:
+    check("unsanitized -Infinity is rejected by a strict reader", True)
+
+# And the fix actually produces something a strict reader accepts.
+raw_sanitized = json.dumps(bridge._json_safe({"rms": float("-inf"), "peak": float("-inf"), "ok": True}))
+try:
+    json.loads(raw_sanitized, parse_constant=lambda tok: (_ for _ in ()).throw(ValueError(tok)))
+    check("the sanitized payload passes a strict reader", True)
+except ValueError as e:
+    check("the sanitized payload passes a strict reader", False, str(e))
+
 print(f"\n{'all passed' if not failures else str(len(failures)) + ' failed'}")
 sys.exit(1 if failures else 0)

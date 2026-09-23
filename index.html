@@ -2742,12 +2742,14 @@ function renderRecord(){
           outputChannel: cap.outputChannel, sampleRate: 48000,
         });
         const assigned = new Set(Object.values(cap.channels));
+        // True digital silence comes back as null, not a number - the bridge
+        // cannot put -Infinity in a JSON response the browser can parse.
         resultBox.innerHTML = `<div style="margin-top:12px;">` + r.inputs.map(i=>{
           const mine = assigned.has(i.channel);
-          const live = isFinite(i.peak) && i.peak > -60;
+          const live = i.peak != null && i.peak > -60;
           return `<div class="kv"><span>${mine?'<b>':''}Input ${i.channel}${mine?'</b>':''}</span>
             <span style="color:${live?'var(--good)':'var(--text-faint)'}">${
-              isFinite(i.peak) ? i.peak.toFixed(1)+' dBFS peak' : 'silent'}</span></div>`;
+              i.peak != null ? i.peak.toFixed(1)+' dBFS peak' : 'silent'}</span></div>`;
         }).join('') + `<p class="hint">A tone went out of output ${cap.outputChannel}. The inputs your chains
           use should show signal; the rest should be quiet.</p></div>`;
       }catch(e){
@@ -2784,7 +2786,7 @@ function renderRecord(){
         resultBox.innerHTML = `<div style="margin-top:12px;">` + r.results.map(res=>`
           <div class="kv"><span>${escapeHtml(res.chain)}</span><span>${
             res.delayDetected ? `delay ${res.delay}` : 'delay not detected'} ·
-            ${res.peak.toFixed(1)} dBFS peak${res.clipped ? ' · <b style="color:var(--danger)">clipped</b>' : ''}</span></div>`).join('')
+            ${res.peak != null ? res.peak.toFixed(1)+' dBFS peak' : 'silent'}${res.clipped ? ' · <b style="color:var(--danger)">clipped</b>' : ''}</span></div>`).join('')
           + `<p class="hint">Saved to ${escapeHtml(cap.outDir)}. Delays written to the chains.</p>
              <div id="capKnobCheck"></div></div>`;
         renderNav(); markNextRow(); updateProgressStat();

@@ -58,6 +58,29 @@ class BridgeError(RuntimeError):
     """Something the user can act on; reported as a clean message, not a stack."""
 
 
+def _json_safe(value):
+    """
+    Recursively replace inf/-inf/nan with None.
+
+    dbfs() and peak_dbfs() return float('-inf') for true digital silence - an
+    unpatched input, or a channel with nothing connected - which is a normal,
+    expected reading, not a fault. Python's json.dumps serialises it as the
+    bare token -Infinity, which is valid in Python's own relaxed reader but not
+    in the JSON spec the browser's JSON.parse enforces: it throws, the fetch
+    that otherwise succeeded looks like a failure, and the page reports
+    "Bridge returned 200" instead of the silence reading it was sent. Replacing
+    it with null keeps the response valid JSON and lets the page's own
+    isFinite() checks report "silent" the way they were always meant to.
+    """
+    if isinstance(value, float):
+        return None if (value != value or value in (float("inf"), float("-inf"))) else value
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
 # ----------------------------------------------------------------------------
 # lazy imports: the page must still load and explain itself if audio is broken
 # ----------------------------------------------------------------------------
@@ -450,7 +473,7 @@ class Handler(SimpleHTTPRequestHandler):
             sys.stderr.write("  %s\n" % (fmt % args))
 
     def _json(self, payload, status=200):
-        data = json.dumps(payload).encode()
+        data = json.dumps(_json_safe(payload)).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
