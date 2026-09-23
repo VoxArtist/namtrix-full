@@ -202,7 +202,70 @@ def learning_config(epochs: int) -> dict:
     return cfg
 
 
-def data_config(runs: list[dict], preset: str, signals: dict) -> dict:
+# Room left at the end of every validation clip for the network's receptive
+# field (about 6,350 samples for this architecture), with some to spare.
+_RECEPTIVE_MARGIN = 8192
+_V3_VALIDATION_SECONDS = 9.0
+
+
+def _wav_frames(path) -> tuple[int, int]:
+    import wave
+
+    with wave.open(str(path)) as w:
+        return w.getnframes(), w.getframerate()
+
+
+def _validation_ny(runs: list[dict], clip_frames: int) -> int:
+    """
+    One window length for every validation clip.
+
+    Each take's latency trims its clip by a different few samples, and the
+    trainer refuses validation clips of unequal length ("Mismatch between ny of
+    datasets"). Letting it size each clip itself failed a real 79-take session
+    over seven samples; sizing them all to fit the take with the most latency
+    cannot.
+    """
+    worst = max(abs(int(r.get("delay") or 0)) for r in runs)
+    ny = clip_frames - worst - _RECEPTIVE_MARGIN
+    if ny < 4096:
+        raise TrainingError(
+            f"The measured latency ({worst} samples) leaves too little of the "
+            "validation clip to check the model against. Test the route again: "
+            "a real interface is usually under 1,000 samples."
+        )
+    return ny
+
+
+# Below this a take carries no signal worth scoring: the same line the holdout
+# validation uses.
+SILENT_DBFS = -45.0
+
+
+def clip_rms_dbfs(path, last_seconds: float | None = None) -> float:
+    """RMS level of a take (or its last few seconds), cheaply: every 16th sample."""
+    import array
+    import math
+    import wave
+
+    with wave.open(str(path)) as w:
+        rate, width, channels, frames = (w.getframerate(), w.getsampwidth(),
+                                         w.getnchannels(), w.getnframes())
+        if last_seconds:
+            w.setpos(max(0, frames - int(last_seconds * rate)))
+            frames = min(frames, int(last_seconds * rate))
+        raw = w.readframes(frames)
+    stride = width * channels * 16
+    total, count = 0.0, 0
+    full = float(2 ** (8 * width - 1))
+    for i in range(0, len(raw) - width + 1, stride):
+        v = int.from_bytes(raw[i:i + width], "little", signed=(width > 1)) / full
+        total += v * v
+        count += 1
+    rms = math.sqrt(total / count) if count else 0.0
+    return 20 * math.log10(rms) if rms > 0 else float("-inf")
+
+
+def data_config(runs: list[dict], preset: str, signals: dict, is_silent=None) -> dict:
     """
     One entry per recorded run.
 
@@ -214,30 +277,46 @@ def data_config(runs: list[dict], preset: str, signals: dict) -> dict:
     Standard signal: train on 10 s to the last 9 s of each take, validate on that
     last 9 s. Short pair: train on inputTrunc.wav, validate on the separately
     recorded validation.wav take of the same run.
+
+    A near-silent take stays in training - it teaches that those settings are
+    quiet - but not in validation. The trainer averages its score per take, and
+    one silent take's ratio is noise in the thousands (a real session scored
+    5,925 after its first epoch), which would decide which checkpoint is kept.
+    is_silent(path, last_seconds) says which; without it nothing is left out.
     """
     train, validation = [], []
+    if not runs:
+        raise TrainingError("No recorded runs to train on.")
+    if preset == "short":
+        val_ny = _validation_ny(runs, _wav_frames(signals["short_val"])[0]) \
+            if Path(signals["short_val"]).exists() else None
+    else:
+        rate = _wav_frames(signals["v3"])[1] if Path(signals["v3"]).exists() else 48000
+        val_ny = _validation_ny(runs, int(_V3_VALIDATION_SECONDS * rate))
     for run in runs:
         base = {"params": {k: float(v) for k, v in run["params"].items()},
                 "delay": int(run.get("delay") or 0)}
         if preset == "short":
             train.append({**base, "x_path": signals["short_train"], "y_path": run["y"],
                           "start_seconds": 0.0, "stop_seconds": None, "ny": 8192})
-            if run.get("yVal"):
+            if run.get("yVal") and not (is_silent and is_silent(run["yVal"], None)):
                 validation.append({**base, "x_path": signals["short_val"],
                                    "y_path": run["yVal"], "start_seconds": 0.0,
-                                   "stop_seconds": None, "ny": None,
+                                   "stop_seconds": None, "ny": val_ny,
                                    "require_input_pre_silence": None})
         else:
             train.append({**base, "x_path": signals["v3"], "y_path": run["y"],
                           "start_seconds": 10.0, "stop_seconds": -9.0, "ny": 8192})
+            if is_silent and is_silent(run["y"], _V3_VALIDATION_SECONDS):
+                continue
             validation.append({**base, "x_path": signals["v3"], "y_path": run["y"],
-                               "start_seconds": -9.0, "stop_seconds": None, "ny": None,
+                               "start_seconds": -9.0, "stop_seconds": None, "ny": val_ny,
                                "require_input_pre_silence": None})
     if not train:
         raise TrainingError("No recorded runs to train on.")
     if not validation:
-        raise TrainingError("No validation takes were recorded, so training has nothing "
-                            "to check itself against.")
+        raise TrainingError("No validation take has sound in it, so training has nothing "
+                            "to check itself against. Check the recordings are not silent.")
     return {"type": "parametric", "common": {"delay": 0},
             "train": train, "validation": validation}
 
@@ -305,6 +384,9 @@ def _child_env() -> dict:
 
 
 _EPOCH = re.compile(r"Epoch (\d+)")
+# The trainer's progress bar: "Epoch 3/399 ━━━━╸ 132/156 0:00:37 • 0:00:07 3.48it/s"
+_PROGRESS = re.compile(r"Epoch (\d+)/(\d+)\D+?(\d+)/(\d+)")
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07|\x1b[=>()][0-9A-B]?")
 _ESR = re.compile(r"ESR=([0-9.eE+-]+)")
 _CKPT_EPOCH = re.compile(r"epoch=(\d+)")
 
@@ -371,7 +453,7 @@ class TrainJob:
         self.state = "running"
         self.error = None
         self.chains = [{"name": c["name"], "modelName": _safe_name(c["modelName"]),
-                        "state": "waiting", "epoch": 0, "bestEsr": None,
+                        "state": "waiting", "epoch": 0, "bestEsr": None, "silentLeftOut": 0,
                         "runDir": None, "files": [], "log": None}
                        for c in request["chains"]]
         self.current = 0
@@ -405,6 +487,14 @@ class TrainJob:
             if esr is not None:
                 chain["bestEsr"] = esr
             chain["epoch"] = max(chain["epoch"], epochs_done(run_dir))
+        done_chains = sum(1 for c in self.chains if c["state"] in ("done", "stopped"))
+        within = 0.0
+        if chain and chain["state"] == "training":
+            within = (chain["epoch"] + (chain.get("step", 0) / chain["steps"]
+                                        if chain.get("steps") else 0)) / self.epochs
+        fraction = min(1.0, (done_chains + within) / max(1, len(self.chains)))
+        if self.state == "done":
+            fraction = 1.0
         return {
             "state": self.state,
             "error": self.error,
@@ -413,6 +503,7 @@ class TrainJob:
             "current": self.current,
             "chains": self.chains,
             "elapsed": (self.finished or time.time()) - self.started,
+            "fraction": fraction,
             "tail": self._tail[-12:],
         }
 
@@ -453,8 +544,12 @@ class TrainJob:
             local_signals[key] = str(dst)
 
         knobs = self.request["knobs"]
+        info["state"] = "checking"
+        silent = lambda path, last: clip_rms_dbfs(path, last) < SILENT_DBFS  # noqa: E731
+        data = data_config(spec["runs"], preset, local_signals, silent)
+        info["silentLeftOut"] = len(spec["runs"]) - len(data["validation"])
         files = {
-            "data": data_config(spec["runs"], preset, local_signals),
+            "data": data,
             "model": model_config(knobs),
             "learning": learning_config(self.epochs),
         }
@@ -467,30 +562,57 @@ class TrainJob:
         cmd = ["/usr/bin/caffeinate", "-i", self.trainer["path"],
                str(config_dir / "data.json"), str(config_dir / "model.json"),
                str(config_dir / "learning.json"), str(base), "--no-plots"]
-        info["state"] = "training"
-        with open(log_path, "wb") as log:
-            self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                          stderr=subprocess.STDOUT, env=_child_env(),
-                                          start_new_session=True)
-            buf = b""
+        info["state"] = "preparing"
+        info["step"], info["steps"] = 0, 0
+        # Through a pipe the trainer's progress bar draws nothing until the very
+        # end, so it gets a pseudo-terminal instead and its live bar is read
+        # back: that is the only progress it reports within an epoch.
+        import fcntl
+        import pty
+        import struct
+        import termios
+
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 50, 200, 0, 0))
+        env = _child_env()
+        env.update({"COLUMNS": "200", "LINES": "50", "TERM": "xterm-256color"})
+        last_logged_epoch = -1
+        with open(log_path, "w", encoding="utf-8") as log:
+            self._proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=slave,
+                                          stderr=slave, env=env, start_new_session=True)
+            os.close(slave)
+            buf = ""
             while True:
-                chunk = self._proc.stdout.read1(4096) if hasattr(self._proc.stdout, "read1") \
-                    else self._proc.stdout.read(4096)
+                try:
+                    chunk = os.read(master, 8192)
+                except OSError:          # the terminal closes when the trainer exits
+                    break
                 if not chunk:
                     break
-                log.write(chunk)
-                log.flush()
-                buf += chunk
+                buf += _ANSI.sub("", chunk.decode("utf-8", "replace"))
                 # progress bars redraw with \r, so either ends a line
-                parts = re.split(rb"[\r\n]", buf)
+                parts = re.split(r"[\r\n]", buf)
                 buf = parts.pop()
-                for raw in parts:
-                    line = raw.decode("utf-8", "replace").strip()
+                for line in parts:
+                    line = line.strip()
                     if not line:
                         continue
-                    m = _EPOCH.search(line)
+                    m = _PROGRESS.search(line)
                     if m:
-                        info["epoch"] = int(m.group(1)) + 1
+                        epoch, last, step, steps = (int(g) for g in m.groups())
+                        info["state"] = "training"
+                        info["epoch"] = max(info["epoch"], epoch)
+                        info["step"], info["steps"] = step, steps
+                        # the log keeps one line per epoch, not every redraw
+                        if step == steps and epoch != last_logged_epoch:
+                            last_logged_epoch = epoch
+                            log.write(line + "\n")
+                            log.flush()
+                        continue
+                    if line.startswith(("Validation", "Sanity Checking")):
+                        continue          # its own progress bar, redrawn constantly
+                    log.write(line + "\n")
+                    log.flush()
                     self._tail.append(line[-240:])
                     del self._tail[:-40]
                 if info["runDir"] is None:
@@ -499,6 +621,7 @@ class TrainJob:
                     if new:
                         info["runDir"] = str(new[0])
             code = self._proc.wait()
+            os.close(master)
 
         if info["runDir"] is None:
             new = [p for p in base.iterdir() if p.is_dir() and p not in before
@@ -508,11 +631,18 @@ class TrainJob:
         exported = run_dir and (run_dir / "model_parametric.nam").exists()
         if not exported and self._stop and run_dir:
             exported = adopt_best_checkpoint(run_dir)
+        if not exported and self._stop:
+            # Stopped inside the first epoch: no checkpoint exists yet. That is
+            # the user's choice, not a failure.
+            info["state"] = "stopped"
+            return
         if code != 0 and not exported:
             info["state"] = "failed"
-            tail = "\n".join(self._tail[-6:])
+            reason = next((line for line in reversed(self._tail)
+                           if re.search(r"(Error|Exception)\b", line)), None) \
+                or (self._tail[-1] if self._tail else f"exit code {code}")
             raise TrainingError(
-                f"Training {info['name']} stopped with an error. The last lines were:\n{tail}"
+                f"Training {info['name']} stopped: {reason}"
                 f"\n\nThe full log is {log_path}."
             )
         if not exported:

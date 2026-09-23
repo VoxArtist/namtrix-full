@@ -67,6 +67,48 @@ try:
 except training.TrainingError:
     check("short with no validation takes is refused", True)
 
+# --- validation clips are all one length, whatever each take's latency ---
+import wave as _wave
+with tempfile.TemporaryDirectory() as tmp:
+    val = Path(tmp) / "validation.wav"
+    with _wave.open(str(val), "wb") as w:              # 7 s at 48 kHz, like the real cut
+        w.setnchannels(1); w.setsampwidth(3); w.setframerate(48000)
+        w.writeframes(b"\x00\x00\x00" * 336000)
+    sig = {**SIGNALS, "short_val": str(val)}
+    # the latencies of the session that failed: 12,380 to 12,403 samples
+    runs = [{**RUNS[0], "delay": 12380}, {**RUNS[1], "delay": 12403}]
+    d = training.data_config(runs, "short", sig)
+    nys = {e["ny"] for e in d["validation"]}
+    check("validation windows share one length", len(nys) == 1)
+    ny = nys.pop()
+    check("that length fits the take with the most latency",
+          ny + 12403 + 6400 <= 336000, str(ny))
+    try:
+        training.data_config([{**RUNS[0], "delay": 330000}], "short", sig)
+        check("an impossible latency is refused", False)
+    except training.TrainingError:
+        check("an impossible latency is refused", True)
+
+    # silent takes train but do not validate
+    silent = lambda path, last: path.endswith("run_002_val.wav")  # noqa: E731
+    d = training.data_config(RUNS, "short", sig, silent)
+    check("a silent take still trains", len(d["train"]) == 2)
+    check("a silent take is left out of validation",
+          [e["y_path"] for e in d["validation"]] == ["/r/run_001_val.wav"])
+    try:
+        training.data_config(RUNS, "short", sig, lambda p, l: True)
+        check("all-silent validation is refused", False)
+    except training.TrainingError:
+        check("all-silent validation is refused", True)
+
+    # the level meter itself: a silent file and a loud one
+    loud = Path(tmp) / "loud.wav"
+    with _wave.open(str(loud), "wb") as w:
+        w.setnchannels(1); w.setsampwidth(3); w.setframerate(48000)
+        w.writeframes((int(0.5 * 2**23).to_bytes(3, "little", signed=True)) * 48000)
+    check("silence reads as silent", training.clip_rms_dbfs(val) < training.SILENT_DBFS)
+    check("a -6 dBFS take reads as -6", abs(training.clip_rms_dbfs(loud) + 6.02) < 0.1)
+
 # --- model: one param per knob, in order, default in the middle ---
 m = training.model_config([{"name": "Drive", "min": 0, "max": 10}, {"name": "Tone", "min": 1, "max": 5}])
 params = m["net"]["config"]["params"]
