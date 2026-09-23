@@ -73,6 +73,9 @@ GAIN_LOW_DBFS = -18.0
 GAIN_HIGH_DBFS = -3.0
 LIVE_DBFS = -60.0
 
+# Set by "cancel this run": the capture in progress stops and saves nothing.
+_capture_cancel = threading.Event()
+
 # Only one training or validation job at a time; the GPU is not shareable either.
 _jobs = {"train": None, "validate": None, "install": None}
 
@@ -570,7 +573,38 @@ def build_playback(signal, preamble):
     return np.concatenate([pre, pad, signal.astype(np.float32)]), len(pre) + len(pad)
 
 
+def do_capture_cancel(body):
+    """
+    Stop the take that is playing. The capture thread sees the flag when the
+    stream returns and writes nothing, so a cancelled take never reaches disk.
+    """
+    _capture_cancel.set()
+    try:
+        _audio()["sd"].stop()
+    except Exception:  # noqa: BLE001 - nothing playing is fine
+        pass
+    return {"ok": True}
+
+
+def do_delete_takes(body):
+    """Delete named takes from the recordings folder: the files of a cancelled run."""
+    out_dir = Path(body.get("outDir") or "").expanduser()
+    deleted = []
+    for name in body.get("files") or []:
+        name = str(name)
+        if "/" in name or name.startswith(".") or not name.lower().endswith(".wav"):
+            raise BridgeError(f"Not a take name: {name}")
+        target = (out_dir / name).resolve()
+        if target.is_file() and _may_serve(str(target)):
+            target.unlink()
+            with _written_lock:
+                _written_takes.discard(str(target))
+            deleted.append(name)
+    return {"ok": True, "deleted": deleted}
+
+
 def do_capture(body):
+    _capture_cancel.clear()
     mods = _audio()
     np, BlipPreamble, measure_delay = mods["np"], mods["BlipPreamble"], mods["measure_delay"]
 
@@ -616,6 +650,8 @@ def do_capture(body):
         blocksize=int(body.get("blocksize") or 0),
         latency=body.get("latency") or "high",
     )
+    if _capture_cancel.is_set():
+        raise BridgeError("Recording cancelled; nothing was saved.")
     if dropped:
         raise BridgeError(
             "The audio stream dropped samples, so this take is not trustworthy. "
@@ -875,6 +911,8 @@ class Handler(SimpleHTTPRequestHandler):
     OTHER_ROUTES = {
         "/api/choose-folder": do_choose_folder,
         "/api/allow-folder": do_allow_folder,
+        "/api/capture/cancel": do_capture_cancel,
+        "/api/delete-takes": do_delete_takes,
         "/api/reveal": do_reveal,
         "/api/presets": do_save_presets,
         "/api/trainer/locate": do_trainer_locate,
