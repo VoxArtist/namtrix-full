@@ -75,7 +75,7 @@ from MIT-licensed projects.
 1. **Parameter space.** Pick a gear preset or enter the controls. *Save as preset* adds your
    gear to the list under *My presets* (kept by the app, so it survives a restart). *Skip 0*
    keeps a control off 0 in the run sheet, since a silent take costs a full run and teaches
-   the model nothing; it starts ticked for any control named Gain, Lead or Master.
+   the model nothing; it starts ticked for any control named Gain, Lead, Master, Volume, Level or Output.
 2. **OED matrix.** Choose run counts and the reamp signal — *Long* (NAM's standard 190 s
    input) or *Short* (38 s + a 7 s validation cut) — and the time estimate follows.
 3. **Reamp & record**, in order:
