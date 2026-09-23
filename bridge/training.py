@@ -236,9 +236,11 @@ def _validation_ny(runs: list[dict], clip_frames: int) -> int:
     return ny
 
 
-# Below this a take carries no signal worth scoring: the same line the holdout
-# validation uses.
-SILENT_DBFS = -45.0
+# Below this a take is silence, not a quiet setting. On a real 79-take session
+# the silent takes (a volume, gain or lead at 0) sat near -86 dBFS and the
+# quietest real ones near -57; -45 would have thrown fourteen real takes out of
+# validation along with the eleven silent ones.
+SILENT_DBFS = -60.0
 
 
 def clip_rms_dbfs(path, last_seconds: float | None = None) -> float:
