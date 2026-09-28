@@ -530,7 +530,9 @@ class TrainJob:
     def _train_chain(self, i: int, spec: dict):
         info = self.chains[i]
         info["state"] = "preparing"
-        base = self.out_dir / info["modelName"]
+        # Final NAM Profiles/<model>.nam, and everything that made it under
+        # Final NAM Profiles/training runs/<model>/ - configs, log, checkpoints.
+        base = self.out_dir / "training runs" / info["modelName"]
         config_dir = base / "config"
         config_dir.mkdir(parents=True, exist_ok=True)
 
@@ -667,7 +669,11 @@ class TrainJob:
                 write_metadata(dst, gear, info["name"], parametric, knob_names)
             except Exception:  # noqa: BLE001 - metadata is a nicety, the model is not
                 pass
-            info["files"].append(str(dst))
+            # The finished model, where people look for it. A later training of the same
+            # name replaces it here; its run folder keeps the earlier one.
+            final = self.out_dir / dst.name
+            shutil.copy2(dst, final)
+            info["files"].append(str(final))
         info["state"] = "stopped" if self._stop else "done"
 
 

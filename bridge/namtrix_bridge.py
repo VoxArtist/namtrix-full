@@ -311,11 +311,11 @@ def do_train(body):
             f"{len(missing)} recording{'s are' if len(missing) != 1 else ' is'} missing "
             f"from the recordings folder ({names}{'...' if len(missing) > 4 else ''})."
         )
-    chosen = _osascript_choose("folder", "Choose where to save the trained model",
-                               body.get("defaultDir"))
-    if not chosen:
-        return {"ok": True, "cancelled": True}
-    job = training.TrainJob(body, Path(chosen), trainer, _signal_paths())
+    gear_dir = Path(body.get("gearDir") or "").expanduser()
+    if not str(body.get("gearDir") or "").strip() or not gear_dir.parent.is_dir():
+        raise BridgeError("The recordings folder was not found. Check it on the Reamp & record step.")
+    gear_dir.mkdir(exist_ok=True)
+    job = training.TrainJob(body, gear_dir / "Final NAM Profiles", trainer, _signal_paths())
     _jobs["train"] = job
     job.start()
     return {"ok": True, "cancelled": False, "status": job.status()}
@@ -606,15 +606,72 @@ def do_capture_cancel(body):
     return {"ok": True}
 
 
+def _take_relpath(name: str) -> Path:
+    """A take's path under the recordings folder: a file name, or one chain folder and a file name."""
+    parts = str(name).split("/")
+    if not 1 <= len(parts) <= 2 or any(not p or p.startswith(".") for p in parts) \
+            or not parts[-1].lower().endswith(".wav"):
+        raise BridgeError(f"Not a take name: {name}")
+    return Path(*parts)
+
+
+PROFILE_SWEEPS = {"v3": ("v3",), "short": ("short_train", "short_val")}
+
+
+def do_prepare_profile(body):
+    """
+    Lay out a profile's folder before its first take:
+
+        <gear>/recordings/<chain>/   <gear>/original sweeps/
+
+    The sweeps are the exact files the takes answer, copied once, so the folder
+    stays trainable without this app - and so nobody later has to wonder which
+    input a folder of takes was made with.
+    """
+    import shutil as _shutil
+
+    gear_dir = Path(body.get("gearDir") or "").expanduser()
+    if not str(body.get("gearDir") or "").strip() or not gear_dir.parent.is_dir():
+        raise BridgeError("Choose where the recordings are saved first.")
+    for chain in body.get("chains") or []:
+        name = str(chain)
+        if not name or "/" in name or name.startswith("."):
+            raise BridgeError(f"Not a chain name: {name}")
+        (gear_dir / "recordings" / name).mkdir(parents=True, exist_ok=True)
+    sweeps = gear_dir / "original sweeps"
+    sweeps.mkdir(parents=True, exist_ok=True)
+    for key in PROFILE_SWEEPS.get(body.get("preset") or "v3", ("v3",)):
+        src = signal_path(key)
+        dst = sweeps / src.name
+        if not dst.exists():
+            _shutil.copy2(src, dst)
+    _allow_dir(gear_dir)
+    return {"ok": True, "gearDir": str(gear_dir)}
+
+
+def do_write_export(body):
+    """Write the external-training files into <gear>/External training/."""
+    gear_dir = Path(body.get("gearDir") or "").expanduser()
+    if not gear_dir.is_dir():
+        raise BridgeError("The profile folder does not exist yet: record a take first.")
+    out = gear_dir / "External training"
+    out.mkdir(parents=True, exist_ok=True)
+    written = []
+    for name, text in (body.get("files") or {}).items():
+        if "/" in name or name.startswith(".") or not name:
+            raise BridgeError(f"Not a file name: {name}")
+        (out / name).write_text(str(text))
+        written.append(name)
+    return {"ok": True, "dir": str(out), "files": written}
+
+
 def do_delete_takes(body):
     """Delete named takes from the recordings folder: the files of a cancelled run."""
     out_dir = Path(body.get("outDir") or "").expanduser()
     deleted = []
     for name in body.get("files") or []:
         name = str(name)
-        if "/" in name or name.startswith(".") or not name.lower().endswith(".wav"):
-            raise BridgeError(f"Not a take name: {name}")
-        target = (out_dir / name).resolve()
+        target = (out_dir / _take_relpath(name)).resolve()
         if target.is_file() and _may_serve(str(target)):
             target.unlink()
             with _written_lock:
@@ -641,7 +698,7 @@ def do_capture(body):
     overwrite = bool(body.get("overwrite"))
     targets = {}
     for chain in chains:
-        target = out_dir / chain["file"]
+        target = out_dir / _take_relpath(chain["file"])
         if target.exists() and not overwrite:
             raise BridgeError(
                 f"{target.name} already exists. Re-recording this run would overwrite a "
@@ -651,7 +708,7 @@ def do_capture(body):
     # The other files this run will write, checked now so a clash on the second
     # half of a take is caught before the first half has been played.
     for name in body.get("alsoCheck") or []:
-        other = out_dir / name
+        other = out_dir / _take_relpath(name)
         if other.exists() and not overwrite:
             raise BridgeError(
                 f"{other.name} already exists. Re-recording this run would overwrite a "
@@ -934,6 +991,8 @@ class Handler(SimpleHTTPRequestHandler):
     OTHER_ROUTES = {
         "/api/choose-folder": do_choose_folder,
         "/api/allow-folder": do_allow_folder,
+        "/api/prepare-profile": do_prepare_profile,
+        "/api/write-export": do_write_export,
         "/api/capture/cancel": do_capture_cancel,
         "/api/delete-takes": do_delete_takes,
         "/api/reveal": do_reveal,

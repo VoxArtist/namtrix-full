@@ -93,14 +93,15 @@ from MIT-licensed projects.
       early end of the readings), since the readings drift with the amp's settings while the
       wiring's delay does not.
    5. *File names* — with examples for a training and a holdout (verification) run.
-   6. *Recordings folder* — chosen in a normal macOS folder dialog.
+   6. *Recordings folder* — chosen in a normal macOS folder dialog. The profile gets its own
+      folder inside it, named after the gear (see *Folders* below).
    7. *Record* — each run shows its knob settings full screen; dial them, press Record. A
       take that clips, or comes back silent, is not ticked off.
    8. *Check the recordings* — see below.
-4. **Train.** Pick epochs (400 by default) and press Start. A folder dialog asks where the
-   model goes; the app writes the dataset from this session's takes — each with its knob
-   settings and its own measured latency — and runs the trainer, showing progress, best ESR
-   so far and time left. The model name defaults to the gear name.
+4. **Train.** Pick epochs (400 by default) and press Start. The app writes the dataset from
+   this session's takes — each with its knob settings and its chain's fixed delay — and runs
+   the trainer, showing progress, best ESR so far and time left. The models land in the
+   profile's `Final NAM Profiles` folder. The model name defaults to the gear name.
 5. **Validate.** One button. Every holdout run is played through the trained model at its
    knob settings and compared with the real recording; the average ESR comes back with what
    it means.
@@ -151,9 +152,26 @@ like the app itself. Anyone who already has a trainer can point the app at it in
 (*I already have one — locate it*); recording and the knob check need none of this.
 
 Training runs in the background with the Mac kept awake; leave the app open. *Stop early*
-still exports the best model so far. Each chain gets its own folder with the configs, a copy
-of the DI, the log and the trainer's timestamped run folder holding
-`<name>_parametric.nam` (for the NAM Parametric Plugin) and `<name>.nam`.
+still exports the best model so far. The finished `<name>_parametric.nam` (for the NAM
+Parametric Plugin) and `<name>.nam` go to `Final NAM Profiles/`; each chain's configs, log and
+the trainer's run folder go to `Final NAM Profiles/training runs/<name>/`.
+
+## Folders
+
+Everything for a profile lives in one folder, inside the folder chosen on the Reamp & record
+step and named after the gear (the name is fixed at the first take):
+
+```
+<chosen folder>/<Gear name>/
+    recordings/<chain>/     the takes, one folder per capture chain
+    original sweeps/        the input files the takes answer
+    External training/      Export > "Download everything for external training": run sheets,
+                            per-take delays and align_dataset.py, which finds the takes and
+                            sweeps beside it and rebuilds exactly the app's training config
+    Final NAM Profiles/     the trained models; working files under training runs/
+```
+
+Sessions recorded before this layout keep their takes flat in the chosen folder and still work.
 
 Validation scores the checkpoint the trainer exported and writes each holdout prediction to
 `holdout_renders/` in the run folder, so the numbers can be checked by ear.
