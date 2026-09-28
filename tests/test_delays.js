@@ -7,8 +7,8 @@ const code = page.slice(page.indexOf("const DELAY_GROUP_GAP"), page.indexOf("fun
 let failures = 0;
 const check = (name, ok, detail) => { console.log((ok ? "ok   " : "FAIL ") + name + (ok || detail === undefined ? "" : `  (${detail})`)); if (!ok) failures++; };
 
-function make(takeDelays, done) {
-  const state = { takeDelays, runDone: {}, holdoutDone: {} };
+function make(takeDelays, done, takeBlocks = {}) {
+  const state = { takeDelays, takeBlocks, runDone: {}, holdoutDone: {} };
   for (const k of done) { const [kind, run] = k.split(":"); (kind === "holdout" ? state.holdoutDone : state.runDone)[run] = true; }
   const isDone = (kind, run) => !!(kind === "holdout" ? state.holdoutDone : state.runDone)[run];
   return new Function("state", "isDone", code + "; return {delayGroups, takeDelay, measuredDelay};")(state, isDone);
@@ -54,6 +54,28 @@ const amp = { name: "amp", delay: 870 };
 {
   const f = make({ "train:1:amp": 100, "train:1:amp:val": 20 }, ["train:1"]);
   check("validation-cut readings are left out", f.delayGroups("amp").length === 1 && f.delayGroups("amp")[0].lo === 100);
+}
+// takes that know their buffer size group by it, and a take with no reading uses its group's delay
+{
+  const td = {}, done = [], blocks = {};
+  for (let i = 1; i <= 10; i++) { td[`train:${i}:amp`] = 12380 + i; done.push(`train:${i}`); blocks[`train:${i}`] = "high"; }
+  for (let i = 11; i <= 20; i++) { td[`train:${i}:amp`] = 866 + (i % 5); done.push(`train:${i}`); blocks[`train:${i}`] = 256; }
+  done.push("train:21"); blocks["train:21"] = 256;          // quiet take: clicks unreadable, no reading at all
+  done.push("train:22"); blocks["train:22"] = "high";
+  const stale = { name: "amp", delay: 12390 };               // chain's last reading from the other buffer size
+  const f = make(td, done, blocks);
+  check("groups follow the recorded buffer size", f.delayGroups("amp").length === 2 && f.delayGroups("amp").every(g => g.block != null));
+  check("a 256 take with no reading gets the 256 delay, whatever the chain last read", f.takeDelay("train", 21, stale) < 1000, f.takeDelay("train", 21, stale));
+  check("an old take with no reading gets the old delay", f.takeDelay("train", 22, amp) > 12000, f.takeDelay("train", 22, amp));
+  check("every 256 take trains at one delay", new Set([11, 15, 20, 21].map(r => f.takeDelay("train", r, stale))).size === 1);
+}
+// a single late misfire inside a buffer-size group changes nothing
+{
+  const td = {}, done = [], blocks = {};
+  for (let i = 1; i <= 12; i++) { td[`train:${i}:amp`] = 870 + (i % 3); done.push(`train:${i}`); blocks[`train:${i}`] = 256; }
+  td["train:13:amp"] = 1810; done.push("train:13"); blocks["train:13"] = 256;
+  const f = make(td, done, blocks);
+  check("a misfire in a keyed group trains at the group delay", f.takeDelay("train", 13, amp) === f.takeDelay("train", 1, amp), f.takeDelay("train", 13, amp));
 }
 console.log(failures ? `\n${failures} failed` : "\nall passed");
 process.exit(failures ? 1 : 0);

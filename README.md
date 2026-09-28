@@ -82,13 +82,16 @@ from MIT-licensed projects.
    1. *Capture chains* — the device alone, or an amp and cab with how many mics (each mic is
       a chain), optionally plus the head's direct output.
    2. *Output* — where the reamp signal goes, and the *buffer size* (64–2048 samples, 256 by
-      default), as in a DAW. The delay between playing and recording is three buffers: 767
-      samples (16 ms) at 256. Raise it if a take reports dropped samples.
+      default), as in a DAW. A smaller buffer means a shorter delay between playing and recording,
+      so less of each take's end is lost to it. Raise it if a take reports dropped samples.
    3. *Inputs* — one per chain.
-   4. *Test the route* — plays timing blips and the loudest moments of the reamp signal
-      through the chosen output. Each chain gets its peak level, a gain verdict (*increase*,
-      *decrease* or *good*, against a −18 to −3 dBFS target) and its latency, which is saved
-      to the chain and used for training. Test with the gear at its loudest run-sheet setting.
+   4. *Check levels & routing* — plays the loudest moments of the reamp signal through the
+      chosen output and shows each chain's peak level, a gain verdict (*increase*, *decrease*
+      or *good*, against a −18 to −3 dBFS target) and any input picking up signal no chain
+      uses. Check with the gear at its loudest run-sheet setting. The delay is not set here:
+      every take measures its own, and training fixes one delay per chain and buffer size (the
+      early end of the readings), since the readings drift with the amp's settings while the
+      wiring's delay does not.
    5. *File names* — with examples for a training and a holdout (verification) run.
    6. *Recordings folder* — chosen in a normal macOS folder dialog.
    7. *Record* — each run shows its knob settings full screen; dial them, press Record. A
