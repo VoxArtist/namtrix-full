@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Build NAMTRIX Full.app. This is ours, not the user's: what they receive is the
+# Build NAMTRIX Profiler.app. This is ours, not the user's: what they receive is the
 # finished .app, which needs nothing installed to run.
 set -e
 cd "${0:A:h}/.."
@@ -39,7 +39,7 @@ rm -rf build/dist build/work
 "$VENV/bin/pyinstaller" build/namtrix.spec \
   --distpath build/dist --workpath build/work --noconfirm --clean
 
-APP="build/dist/NAMTRIX Full.app"
+APP="build/dist/NAMTRIX Profiler.app"
 
 # Nothing in the bundle may need a newer macOS than the app says it needs:
 # macOS checks the declared minimum, then each library refuses on its own,
@@ -73,12 +73,12 @@ echo "==> zipping"
 # The app and a first-run note together, because the one confusing moment -
 # Gatekeeper refusing a plain double-click - happens before anyone reads a
 # README on the web.
-rm -rf build/dist/payload "build/dist/NAMTRIX-Full-macOS.zip"
+rm -rf build/dist/payload "build/dist/NAMTRIX-Profiler-macOS.zip"
 mkdir -p build/dist/payload
-ditto "$APP" "build/dist/payload/NAMTRIX Full.app"
+ditto "$APP" "build/dist/payload/NAMTRIX Profiler.app"
 cp build/FIRST-RUN.txt "build/dist/payload/Read me first.txt"
-ditto -c -k --sequesterRsrc "build/dist/payload" "build/dist/NAMTRIX-Full-macOS.zip"
+ditto -c -k --sequesterRsrc "build/dist/payload" "build/dist/NAMTRIX-Profiler-macOS.zip"
 rm -rf build/dist/payload
 
-du -sh "$APP" "build/dist/NAMTRIX-Full-macOS.zip"
+du -sh "$APP" "build/dist/NAMTRIX-Profiler-macOS.zip"
 echo "==> done: $APP"

@@ -1,4 +1,4 @@
-# NAMTRIX Full
+# NAMTRIX Profiler
 
 Everything [NAMTRIX Lite](https://github.com/VoxArtist/namtrix) does — Latin Hypercube run
 sheets, snapped knob values, holdout sets — **plus the rest of the job, without a terminal or
@@ -23,9 +23,9 @@ Training needs **macOS 14 Sonoma or later** (the trainer's PyTorch build); on an
 record here and train elsewhere with *Download everything for external training*. Intel Macs
 are not supported.
 
-Download **NAMTRIX-Full-macOS.zip** from the
+Download **NAMTRIX-Profiler-macOS.zip** from the
 [latest release](https://github.com/VoxArtist/namtrix-full/releases), unzip it, and drag
-**NAMTRIX Full.app** to Applications. Nothing else to install — the app carries its own
+**NAMTRIX Profiler.app** to Applications. Nothing else to install — the app carries its own
 Python, numpy and PortAudio.
 
 Double-click it and your browser opens on the tool. Quit it from the Dock when you are done.
@@ -42,7 +42,7 @@ Two things to expect the first time:
      unlocks the next step.
   2. **System Settings → Privacy & Security**, scroll down to the Security section near
      the bottom.
-  3. You'll see *"NAMTRIX Full" was blocked to protect your Mac* with an **Open Anyway**
+  3. You'll see *"NAMTRIX Profiler" was blocked to protect your Mac* with an **Open Anyway**
      button next to it. Click it.
   4. Confirm with your password or Touch ID if asked.
   5. Open the app again — one more confirmation dialog, then it runs from then on.

@@ -967,7 +967,7 @@ class Handler(SimpleHTTPRequestHandler):
         Hand a recorded take back to the page so it can analyse it.
 
         The page does the knob check in the browser - one implementation for Lite
-        and Full both - and a browser cannot open a path off the filesystem. It
+        and Profiler both - and a browser cannot open a path off the filesystem. It
         can fetch one from us, since we are the same origin.
 
         Only files this bridge wrote in this session are served. The set is

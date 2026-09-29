@@ -1,10 +1,10 @@
-NAMTRIX Full — read this once
-=============================
+NAMTRIX Profiler — read this once
+=================================
 
 Needs a Mac with Apple silicon (M1 or later) on macOS 11 or later.
 Training a model needs macOS 14 Sonoma or later.
 
-1. Drag "NAMTRIX Full.app" to your Applications folder.
+1. Drag "NAMTRIX Profiler.app" to your Applications folder.
 
 2. The first time, RIGHT-CLICK it and choose "Open" — do not double-click.
    macOS will ask whether you are sure. Say yes.
@@ -22,7 +22,7 @@ Training a model needs macOS 14 Sonoma or later.
      b. Open System Settings → Privacy & Security.
      c. Scroll down to the Security section near the bottom of the page.
         You'll see a line like:
-            "NAMTRIX Full" was blocked to protect your Mac.
+            "NAMTRIX Profiler" was blocked to protect your Mac.
      d. Click "Open Anyway" next to it.
      e. You may be asked for your Mac password or Touch ID. Confirm.
      f. Open the app again (double-click is fine now). One more dialog

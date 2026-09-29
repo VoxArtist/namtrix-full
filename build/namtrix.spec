@@ -1,6 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 """
-PyInstaller spec for NAMTRIX Full.
+PyInstaller spec for NAMTRIX Profiler.
 
 Bundles CPython, numpy, sounddevice and PortAudio's own dylib alongside the page,
 so the person who receives this installs nothing at all. The alternative - "have
@@ -49,7 +49,7 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz, a.scripts, [],
     exclude_binaries=True,
-    name="NAMTRIX Full",
+    name="NAMTRIX Profiler",
     debug=False,
     strip=False,
     upx=False,
@@ -58,18 +58,20 @@ exe = EXE(
 coll = COLLECT(
     exe, a.binaries, a.datas,
     strip=False, upx=False,
-    name="NAMTRIX Full",
+    name="NAMTRIX Profiler",
 )
 app = BUNDLE(
     coll,
-    name="NAMTRIX Full.app",
+    name="NAMTRIX Profiler.app",
     icon=str(ROOT / "build" / "namtrix.icns"),
+    # Kept from when the app was called NAMTRIX Full: macOS files the microphone
+    # permission under this id, so changing it would ask everyone again.
     bundle_identifier="pt.voxartist.namtrix.full",
     info_plist={
-        "CFBundleName": "NAMTRIX Full",
-        "CFBundleDisplayName": "NAMTRIX Full",
-        "CFBundleShortVersionString": "0.7.15",
-        "CFBundleVersion": "0.7.15",
+        "CFBundleName": "NAMTRIX Profiler",
+        "CFBundleDisplayName": "NAMTRIX Profiler",
+        "CFBundleShortVersionString": "0.7.16",
+        "CFBundleVersion": "0.7.16",
         "LSMinimumSystemVersion": "11.0",
         # Without this the microphone prompt never appears and recordings come
         # back as digital silence - an hour lost to something that looks like a
