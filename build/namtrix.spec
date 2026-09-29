@@ -70,8 +70,8 @@ app = BUNDLE(
     info_plist={
         "CFBundleName": "NAMTRIX Profiler",
         "CFBundleDisplayName": "NAMTRIX Profiler",
-        "CFBundleShortVersionString": "0.7.16",
-        "CFBundleVersion": "0.7.16",
+        "CFBundleShortVersionString": "0.7.17",
+        "CFBundleVersion": "0.7.17",
         "LSMinimumSystemVersion": "11.0",
         # Without this the microphone prompt never appears and recordings come
         # back as digital silence - an hour lost to something that looks like a

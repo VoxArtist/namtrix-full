@@ -19,9 +19,15 @@ the DAW-based workflow.
 ## Installing it
 
 **Requirements:** a Mac with Apple silicon (M1 or later) on **macOS 11 Big Sur or later**.
-Training needs **macOS 14 Sonoma or later** (the trainer's PyTorch build); on an older macOS,
-record here and train elsewhere with *Download everything for external training*. Intel Macs
-are not supported.
+Training needs **macOS 14 Sonoma or later** (the trainer's PyTorch build). Intel Macs are not
+supported.
+
+**Training on another computer** (an older Mac that can't train, or a Windows or Linux PC with an
+NVIDIA GPU): *Save progress*, copy the profile's folder over, and load the progress file in
+[NAMTRIX Lite](https://voxartist.github.io/namtrix/lite/)'s Training step. It builds exactly the
+config Profiler would - the same takes, the delays Profiler measured, the same network - and
+gives the install steps for the trainer. Progress files from before 0.7.17 lack those delays:
+open and save them here once first.
 
 Download **NAMTRIX-Profiler-macOS.zip** from the
 [latest release](https://github.com/VoxArtist/namtrix-full/releases), unzip it, and drag

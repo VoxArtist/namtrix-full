@@ -77,5 +77,24 @@ const amp = { name: "amp", delay: 870 };
   const f = make(td, done, blocks);
   check("a misfire in a keyed group trains at the group delay", f.takeDelay("train", 13, amp) === f.takeDelay("train", 1, amp), f.takeDelay("train", 13, amp));
 }
+// the progress file carries the delay every recorded take trains at, for NAMTRIX Lite
+{
+  const td = {}, done = [], blocks = {};
+  for (let i = 1; i <= 6; i++) { td[`train:${i}:amp`] = 870 + i; td[`train:${i}:mic1`] = 940 + i; done.push(`train:${i}`); blocks[`train:${i}`] = 256; }
+  td["holdout:1:amp"] = 872; td["holdout:1:mic1"] = 943; done.push("holdout:1"); blocks["holdout:1"] = 256;
+  const state = { takeDelays: td, takeBlocks: blocks, runDone: {}, holdoutDone: {},
+    chains: [{ name: "amp", delay: 900 }, { name: "mic1", delay: 990 }],
+    trainMatrix: [1, 2, 3, 4, 5, 6, 7].map(run => ({ run })), holdoutMatrix: [1, 2].map(run => ({ run })) };
+  for (const k of done) { const [kind, run] = k.split(":"); (kind === "holdout" ? state.holdoutDone : state.runDone)[run] = true; }
+  const isDone = (kind, run) => !!(kind === "holdout" ? state.holdoutDone : state.runDone)[run];
+  const td2 = page.slice(page.indexOf("function trainingDelays(){"), page.indexOf("async function saveProgressToFile"));
+  const f = new Function("state", "isDone", code + td2 + "; return {trainingDelays, takeDelay};")(state, isDone);
+  const out = f.trainingDelays();
+  check("training delays cover every recorded take and chain", Object.keys(out).length === 14, Object.keys(out).length);
+  check("runs not recorded are left out", !("train:7:amp" in out) && !("holdout:2:amp" in out));
+  check("each is the delay training uses", Object.entries(out).every(([k, v]) => {
+    const [kind, run, chain] = k.split(":"); return v === f.takeDelay(kind, +run, state.chains.find(c => c.name === chain)); }));
+  check("not the chain's last raw reading", out["train:1:amp"] !== 900 && out["train:1:mic1"] !== 990, JSON.stringify(out));
+}
 console.log(failures ? `\n${failures} failed` : "\nall passed");
 process.exit(failures ? 1 : 0);
