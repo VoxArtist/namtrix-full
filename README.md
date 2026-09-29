@@ -18,6 +18,11 @@ the DAW-based workflow.
 
 ## Installing it
 
+**Requirements:** a Mac with Apple silicon (M1 or later) on **macOS 11 Big Sur or later**.
+Training needs **macOS 14 Sonoma or later** (the trainer's PyTorch build); on an older macOS,
+record here and train elsewhere with *Download everything for external training*. Intel Macs
+are not supported.
+
 Download **NAMTRIX-Full-macOS.zip** from the
 [latest release](https://github.com/VoxArtist/namtrix-full/releases), unzip it, and drag
 **NAMTRIX Full.app** to Applications. Nothing else to install — the app carries its own
@@ -147,8 +152,8 @@ touched, and deleting the folder removes it.
 
 Under the hood the app carries [uv](https://github.com/astral-sh/uv), which fetches its own
 Python 3.12 and the exact package set in `bridge/trainer-requirements.txt` — the one that has
-trained real models here — with the trainer pinned to a fixed commit. Apple silicon only,
-like the app itself. Anyone who already has a trainer can point the app at it instead
+trained real models here — with the trainer pinned to a fixed commit. Apple silicon, macOS 14
+or later; on an older macOS the card says so instead of offering the install. Anyone who already has a trainer can point the app at it instead
 (*I already have one — locate it*); recording and the knob check need none of this.
 
 Training runs in the background with the Mac kept awake; leave the app open. *Stop early*

@@ -6,5 +6,6 @@ __pycache__/
 build/dist/
 build/work/
 build/.venv/
+build/.venv-macos11/
 build/namtrix.iconset/
 build/uv

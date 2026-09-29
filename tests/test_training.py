@@ -186,6 +186,21 @@ with tempfile.TemporaryDirectory() as tmp:
     finally:
         training.CONFIG_FILE, training.MANAGED_BIN, training.MANAGED_READY = saved
 
+# --- training needs macOS 14; the app itself runs on 11 ---
+saved_v = training.macos_version
+try:
+    for v, want in (((13, 6, 1), False), ((14, 0), True), ((15, 7, 5), True), ((), True)):
+        training.macos_version = lambda v=v: v
+        check(f"training on macOS {'.'.join(map(str, v)) or 'unknown'}: {'allowed' if want else 'refused'}",
+              training.training_supported() is want)
+    training.macos_version = lambda: (13, 6)
+    job = training.InstallJob(Path("/nonexistent/uv"), Path("/nonexistent/req.txt"))
+    job._run()
+    check("the install refuses on macOS 13 with the reason", job.state == "failed" and "macOS 14" in (job.error or ""), job.error)
+finally:
+    training.macos_version = saved_v
+check("this Mac's version is read", len(training.macos_version()) >= 2)
+
 print()
 print("all passed" if not failures else f"{failures} failed")
 sys.exit(1 if failures else 0)

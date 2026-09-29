@@ -40,6 +40,25 @@ SUPPORT_DIR = Path(os.environ.get("NAMTRIX_SUPPORT_DIR")
 CONFIG_FILE = SUPPORT_DIR / "config.json"
 TRAINER_BIN = "nam-full-parametric"
 
+# The trainer's PyTorch build is for macOS 14 and later; the app itself runs on 11.
+TRAINING_MIN_MACOS = (14, 0)
+
+
+def macos_version() -> tuple[int, ...]:
+    """This Mac's macOS version, read from the system rather than from Python."""
+    try:
+        out = subprocess.run(["/usr/bin/sw_vers", "-productVersion"], capture_output=True,
+                             text=True, timeout=5).stdout.strip()
+        return tuple(int(x) for x in out.split(".") if x.isdigit())
+    except Exception:  # noqa: BLE001 - unknown means "do not refuse"
+        return ()
+
+
+def training_supported() -> bool:
+    v = macos_version()
+    return not v or v >= TRAINING_MIN_MACOS
+
+
 # The trainer NAMTRIX installs for itself, when asked to.
 MANAGED_DIR = SUPPORT_DIR / "trainer"
 MANAGED_BIN = MANAGED_DIR / "venv" / "bin" / TRAINER_BIN
@@ -753,6 +772,13 @@ class InstallJob:
 
             if sys.platform != "darwin" or platform.machine() != "arm64":
                 raise TrainingError("The automatic install is for Apple silicon Macs (M1 and later).")
+            if not training_supported():
+                raise TrainingError(
+                    f"Training needs macOS {TRAINING_MIN_MACOS[0]} or later, and this Mac runs "
+                    f"macOS {'.'.join(map(str, macos_version()))}. Recording and the checks work here; "
+                    "to train, use Download everything for external training on the Export step "
+                    "and train on a Mac with macOS 14 or later."
+                )
             SUPPORT_DIR.mkdir(parents=True, exist_ok=True)
             free = shutil.disk_usage(SUPPORT_DIR).free
             if free < 4 * 1024 ** 3:

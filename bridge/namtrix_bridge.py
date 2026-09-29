@@ -258,7 +258,9 @@ def trainer_status() -> dict:
     job = _jobs["install"]
     return {**training.find_trainer(),
             "install": job.status() if job else None,
-            "canInstall": _uv_source() is not None}
+            "canInstall": _uv_source() is not None,
+            "macos": ".".join(map(str, training.macos_version())),
+            "trainingSupported": training.training_supported()}
 
 
 def _uv_source() -> Path | None:
