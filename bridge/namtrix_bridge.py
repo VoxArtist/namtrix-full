@@ -44,7 +44,7 @@ if str(Path(__file__).resolve().parent) not in sys.path:
 
 import training  # noqa: E402 - needs the sys.path line above
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"   # a launch reuses a running copy of the same version, replaces an older one
 PREAMBLE_PAD_SECONDS = 0.25   # silence after the preamble before the signal starts
 OPEN_TIMEOUT_SECONDS = 10.0   # PortAudio can block indefinitely opening a dead device
 
@@ -78,6 +78,16 @@ _capture_cancel = threading.Event()
 
 # Only one training or validation job at a time; the GPU is not shareable either.
 _jobs = {"train": None, "validate": None, "install": None}
+
+# The app lives as long as its page. Every open tab checks in; when the last one
+# is gone - it says goodbye on closing, or simply stops checking in - the app
+# quits. Not while a job still runs: closing the tab must not throw away hours of
+# training, so the app quits when that job ends instead.
+_tabs: dict[str, float] = {}          # tab id -> when it last checked in (monotonic)
+_tabs_lock = threading.Lock()
+_tabs_seen = {"any": False}
+TAB_SILENT_SECONDS = 180.0            # a hidden tab's timers can slow to once a minute
+TAB_BYE_GRACE_SECONDS = 8.0           # a reload says goodbye too, then checks straight back in
 
 
 class BridgeError(RuntimeError):
@@ -651,6 +661,61 @@ def do_prepare_profile(body):
     return {"ok": True, "gearDir": str(gear_dir)}
 
 
+def _tab_id(body) -> str:
+    tab = str(body.get("id") or "").strip()
+    if not tab or len(tab) > 64:
+        raise BridgeError("Not a tab id.")
+    return tab
+
+
+def do_tab(body):
+    with _tabs_lock:
+        _tabs[_tab_id(body)] = _time.monotonic()
+        _tabs_seen["any"] = True
+    return {"ok": True}
+
+
+def do_tab_bye(body):
+    # Not removed outright: a reload says goodbye and checks back in a moment later.
+    with _tabs_lock:
+        _tabs[_tab_id(body)] = _time.monotonic() - TAB_SILENT_SECONDS + TAB_BYE_GRACE_SECONDS
+    return {"ok": True}
+
+
+def _busy_reason():
+    if Handler._lock.locked():
+        return "a capture"
+    return _job_busy()
+
+
+def page_closed(now: float | None = None) -> bool:
+    """True once a tab has been open and none is left (quiet ones age out)."""
+    now = _time.monotonic() if now is None else now
+    with _tabs_lock:
+        for tab, seen in list(_tabs.items()):
+            if now - seen > TAB_SILENT_SECONDS:
+                del _tabs[tab]
+        return _tabs_seen["any"] and not _tabs
+
+
+def _quit_with_page(stop, interval: float = 2.0):
+    waiting = None
+    while True:
+        _time.sleep(interval)
+        if not page_closed():
+            waiting = None
+            continue
+        busy = _busy_reason()
+        if busy:
+            if waiting != busy:
+                print(f"  the page was closed; quitting when the {busy} finishes")
+                waiting = busy
+            continue
+        print("  the page was closed - quitting")
+        stop()
+        return
+
+
 def do_rename_profile(body):
     """
     Rename a profile folder when its gear is renamed.
@@ -939,7 +1004,7 @@ class Handler(SimpleHTTPRequestHandler):
         return str(target)
 
     def log_message(self, fmt, *args):
-        if "/api/" in (args[0] if args else ""):
+        if "/api/" in str(args[0] if args else ""):     # an error's first arg is a status, not a line
             sys.stderr.write("  %s\n" % (fmt % args))
 
     def _json(self, payload, status=200):
@@ -1024,6 +1089,8 @@ class Handler(SimpleHTTPRequestHandler):
         "/api/allow-folder": do_allow_folder,
         "/api/prepare-profile": do_prepare_profile,
         "/api/rename-profile": do_rename_profile,
+        "/api/tab": do_tab,
+        "/api/tab/bye": do_tab_bye,
         "/api/write-export": do_write_export,
         "/api/capture/cancel": do_capture_cancel,
         "/api/delete-takes": do_delete_takes,
@@ -1120,6 +1187,48 @@ def _first_free_port(host: str, start: int, tries: int = 20) -> int:
     )
 
 
+def _get_json(url: str, timeout: float = 1.5):
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return json.loads(r.read())
+    except Exception:  # noqa: BLE001 - nothing there, or not us
+        return None
+
+
+def _take_over_running_copy(host: str, port: int) -> bool:
+    """
+    Launching the app while a copy of it is already running must not start a
+    second one on the next port: two copies keep two separate sessions, and the
+    one on the usual address goes on recording into whatever folder it last had.
+
+    Returns True when the running copy should simply be shown instead - the same
+    version, or one busy training. An older idle copy is asked to quit, and this
+    one takes its place.
+    """
+    base = f"http://{host}:{port}"
+    info = _get_json(f"{base}/api/health")
+    if not (info and info.get("ok") and "audio" in info):
+        return False
+    busy = any(((_get_json(f"{base}/api/{kind}/status") or {}).get("status") or {}).get("state") == "running"
+               for kind in ("train", "validate"))
+    if info.get("version") == VERSION or busy:
+        return True
+    _get_json(f"{base}/api/quit")
+    import socket
+
+    for _ in range(50):                       # up to five seconds for it to let go
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                probe.bind((host, port))
+                return False
+            except OSError:
+                _time.sleep(0.1)
+    return True                               # it would not quit: show it rather than start a second
+
+
 def main():
     ap = argparse.ArgumentParser(description="NAMTRIX capture bridge")
     ap.add_argument("--root", default=None)
@@ -1133,6 +1242,13 @@ def main():
     Handler.root = Path(a.root).resolve() if a.root else _bundled_root()
 
     explicit_port = a.port is not None
+    if not explicit_port and _take_over_running_copy(a.host, 8765):
+        print("NAMTRIX is already running - showing it.")
+        if not a.no_browser:
+            import webbrowser
+
+            webbrowser.open(f"http://{a.host}:8765")
+        return
     port = a.port if explicit_port else _first_free_port(a.host, 8765)
 
     print(f"NAMTRIX bridge {VERSION}")
@@ -1167,6 +1283,9 @@ def main():
             signal.signal(sig, _stop)
         except ValueError:
             pass
+
+    threading.Thread(target=_quit_with_page, args=(_stop,), daemon=True,
+                     name="namtrix-quit-with-page").start()
 
     if not a.no_browser:
         # Only once the socket is listening, so the browser cannot beat us to it.
