@@ -651,6 +651,35 @@ def do_prepare_profile(body):
     return {"ok": True, "gearDir": str(gear_dir)}
 
 
+def do_rename_profile(body):
+    """
+    Rename a profile folder when its gear is renamed.
+
+    The folder is named after the gear at the first take, and the app keeps its
+    path from then on; without this, a gear renamed afterwards (or a session
+    started from another gear's) records under the old name for good. Only a
+    rename in place, never onto an existing folder, and never while a job is
+    reading from it.
+    """
+    busy = _job_busy()
+    if busy:
+        raise BridgeError(f"The {busy} is using this folder. Rename the gear when it has finished.")
+    raw_src, raw_dst = str(body.get("from") or "").strip(), str(body.get("to") or "").strip()
+    src, dst = Path(raw_src).expanduser(), Path(raw_dst).expanduser()
+    if not raw_src or not src.is_dir():
+        raise BridgeError("The profile folder was not found.")
+    if not raw_dst or dst.parent != src.parent or not dst.name or dst.name.startswith("."):
+        raise BridgeError("A profile folder can only be renamed where it is.")
+    if not (src / "recordings").is_dir():
+        raise BridgeError(f"{src.name} does not look like a NAMTRIX profile folder.")
+    # a change of case only is the same folder on a Mac's disk, and still a rename
+    if dst.exists() and not src.samefile(dst):
+        raise BridgeError(f"There is already a folder called {dst.name} there.")
+    src.rename(dst)
+    _allow_dir(dst)
+    return {"ok": True, "gearDir": str(dst)}
+
+
 def do_write_export(body):
     """Write the external-training files into <gear>/External training/."""
     gear_dir = Path(body.get("gearDir") or "").expanduser()
@@ -994,6 +1023,7 @@ class Handler(SimpleHTTPRequestHandler):
         "/api/choose-folder": do_choose_folder,
         "/api/allow-folder": do_allow_folder,
         "/api/prepare-profile": do_prepare_profile,
+        "/api/rename-profile": do_rename_profile,
         "/api/write-export": do_write_export,
         "/api/capture/cancel": do_capture_cancel,
         "/api/delete-takes": do_delete_takes,
