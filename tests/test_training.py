@@ -115,6 +115,22 @@ params = m["net"]["config"]["params"]
 check("model: params follow the knobs", [p["name"] for p in params] == ["Drive", "Tone"])
 check("model: default is the midpoint", [p["default"] for p in params] == [5.0, 3.0])
 check("model: HyperWaveNet", m["net"]["name"] == "HyperWaveNet")
+hn = m["net"]["config"]["hypernet"]
+check("knob mapping: larger by default, the author's hidden layer of 16",
+      hn.get("hidden_sizes") == [16] and hn.get("activation") == "LeakyReLU", hn)
+std = training.model_config([{"name": "Drive", "min": 0, "max": 10}], "standard")["net"]["config"]["hypernet"]
+check("knob mapping: standard is what earlier models were trained with",
+      std == {"selector": {"exclude_suffixes": ["_conv.weight"]}}, std)
+check("knob mapping: both keep the conv weights out of the mapping",
+      hn["selector"] == std["selector"])
+hn["selector"]["exclude_suffixes"].append("x")
+check("knob mapping: a config is a copy, the template stays put",
+      training.KNOB_MAPPINGS["larger"]["selector"]["exclude_suffixes"] == ["_conv.weight"])
+try:
+    training.model_config([{"name": "Drive", "min": 0, "max": 10}], "huge")
+    check("knob mapping: an unknown one is refused", False)
+except training.TrainingError:
+    check("knob mapping: an unknown one is refused", True)
 check("learning: epochs applied", training.learning_config(400)["trainer"]["max_epochs"] == 400)
 check("learning: template untouched", training._LEARNING["trainer"]["max_epochs"] == 400
       and training.learning_config(50)["trainer"]["max_epochs"] == 50

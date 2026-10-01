@@ -193,7 +193,22 @@ _LEARNING = {
 }
 
 
-def model_config(knobs: list[dict]) -> dict:
+# How knob positions become changes to the network (the "hypernet"). Left unset,
+# the trainer uses its own default, its smallest on purpose - rank 2, no hidden
+# layer - and its notes say to grow it when validation shows the need. A 9-knob
+# amp did: it stalled near 0.27 while one take alone trained to 0.02. "larger" is
+# what the trainer author's own capture tool uses, a hidden layer of 16.
+_SELECTOR = {"exclude_suffixes": ["_conv.weight"]}
+KNOB_MAPPINGS = {
+    "standard": {"selector": _SELECTOR},
+    "larger": {"hidden_sizes": [16], "activation": "LeakyReLU", "selector": _SELECTOR},
+}
+DEFAULT_KNOB_MAPPING = "larger"
+
+
+def model_config(knobs: list[dict], mapping: str = DEFAULT_KNOB_MAPPING) -> dict:
+    if mapping not in KNOB_MAPPINGS:
+        raise TrainingError(f"Unknown knob mapping '{mapping}'.")
     params = []
     for k in knobs:
         lo, hi = float(k["min"]), float(k["max"])
@@ -206,7 +221,7 @@ def model_config(knobs: list[dict]) -> dict:
                 "layers": [copy.deepcopy(_LAYER)],
                 "head_scale": 0.01,
                 "params": params,
-                "hypernet": {"selector": {"exclude_suffixes": ["_conv.weight"]}},
+                "hypernet": copy.deepcopy(KNOB_MAPPINGS[mapping]),
             },
         },
         "loss": {"val_loss": "esr", "mrstft_weight": 0.0005},
@@ -573,7 +588,7 @@ class TrainJob:
         info["silentLeftOut"] = len(spec["runs"]) - len(data["validation"])
         files = {
             "data": data,
-            "model": model_config(knobs),
+            "model": model_config(knobs, self.request.get("knobMapping") or DEFAULT_KNOB_MAPPING),
             "learning": learning_config(self.epochs),
         }
         for name, payload in files.items():
@@ -688,9 +703,15 @@ class TrainJob:
                 write_metadata(dst, gear, info["name"], parametric, knob_names)
             except Exception:  # noqa: BLE001 - metadata is a nicety, the model is not
                 pass
-            # The finished model, where people look for it. A later training of the same
-            # name replaces it here; its run folder keeps the earlier one.
+            # The finished model, where people look for it. One already there under the
+            # same name (an earlier training) moves to "earlier models", dated, rather
+            # than being replaced: comparing two trainings is the usual reason for a second.
             final = self.out_dir / dst.name
+            if final.exists():
+                earlier = self.out_dir / "earlier models"
+                earlier.mkdir(exist_ok=True)
+                stamp = _dt.datetime.fromtimestamp(final.stat().st_mtime).strftime("%Y-%m-%d %H-%M")
+                final.rename(earlier / f"{final.stem} ({stamp}){final.suffix}")
             shutil.copy2(dst, final)
             info["files"].append(str(final))
         info["state"] = "stopped" if self._stop else "done"
