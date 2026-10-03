@@ -206,9 +206,40 @@ KNOB_MAPPINGS = {
 DEFAULT_KNOB_MAPPING = "larger"
 
 
-def model_config(knobs: list[dict], mapping: str = DEFAULT_KNOB_MAPPING) -> dict:
+# Network width and training length by the size of the job (docs/PROFILER-CHANGES.md).
+# 16 channels beat 8 on a 9-knob amp, on settings it trained on and on ones it did not;
+# it costs twice the training time and about twice the plugin's CPU, so fewer knobs keep 8.
+WIDE_FROM_KNOBS = 8
+
+
+def default_channels(n_knobs: int) -> int:
+    return 16 if n_knobs >= WIDE_FROM_KNOBS else 8
+
+
+# The best models of a 110-run session peaked near 565,000 training steps (395 epochs x
+# 1,430 steps). Steps per epoch grow with the runs, so more runs need fewer epochs for the
+# same training; clamped so a small session still trains long enough and a big one ends.
+TRAIN_STEPS = 565_000
+_TRAIN_SECONDS = {"short": 38.0, "v3": 171.0}      # audio each run trains on
+_STEP_SAMPLES, _BATCH = 8192, 16
+
+
+def default_epochs(train_runs: int, preset: str) -> int:
+    per_run = _TRAIN_SECONDS.get(preset, 171.0) * 48000 / _STEP_SAMPLES / _BATCH
+    return int(min(400, max(100, round(TRAIN_STEPS / (per_run * max(1, train_runs))))))
+
+
+def model_config(knobs: list[dict], mapping: str = DEFAULT_KNOB_MAPPING,
+                 channels: int = 8, epochs: int | None = None) -> dict:
+    """
+    channels: the network's width; 16 trains with half the learning rate, as twice the
+    width at the full rate diverged in its first epochs. epochs: when given, the rate
+    decays each epoch so it always ends at 9% of where it started, however long the run.
+    """
     if mapping not in KNOB_MAPPINGS:
         raise TrainingError(f"Unknown knob mapping '{mapping}'.")
+    if channels not in (8, 16):
+        raise TrainingError(f"Unsupported network width: {channels} channels.")
     params = []
     for k in knobs:
         lo, hi = float(k["min"]), float(k["max"])
@@ -218,15 +249,16 @@ def model_config(knobs: list[dict], mapping: str = DEFAULT_KNOB_MAPPING) -> dict
         "net": {
             "name": "HyperWaveNet",
             "config": {
-                "layers": [copy.deepcopy(_LAYER)],
+                "layers": [{**copy.deepcopy(_LAYER), "channels": channels}],
                 "head_scale": 0.01,
                 "params": params,
                 "hypernet": copy.deepcopy(KNOB_MAPPINGS[mapping]),
             },
         },
         "loss": {"val_loss": "esr", "mrstft_weight": 0.0005},
-        "optimizer": {"lr": 0.002, "weight_decay": 3.17e-07},
-        "lr_scheduler": {"class": "ExponentialLR", "kwargs": {"gamma": 0.994}},
+        "optimizer": {"lr": 0.001 if channels >= 16 else 0.002, "weight_decay": 3.17e-07},
+        "lr_scheduler": {"class": "ExponentialLR",
+                         "kwargs": {"gamma": round(0.09 ** (1 / epochs), 5) if epochs else 0.994}},
     }
 
 
@@ -301,7 +333,45 @@ def clip_rms_dbfs(path, last_seconds: float | None = None) -> float:
     return 20 * math.log10(rms) if rms > 0 else float("-inf")
 
 
-def data_config(runs: list[dict], preset: str, signals: dict, is_silent=None) -> dict:
+# Choosing the checkpoint by settings the model never trained on. A run's own validation
+# cut sits at a trained setting, so the best score there rewards repeating trained
+# settings; on two amps that number disagreed with the holdouts. With enough runs, a few
+# whole runs - loud, spread across the knob space - are held back and validate alone.
+HOLDBACK_RUNS = 10
+HOLDBACK_FROM_RUNS = 40
+_HOLDBACK_LOUD_DBFS = -35.0
+
+
+def pick_holdback(runs: list[dict], preset: str, n: int = HOLDBACK_RUNS, level=None) -> list[int]:
+    """Indexes of up to n loud runs, spread out: the first nearest the middle, then each the
+    farthest from those already picked (knob values scaled to their range)."""
+    level = level or clip_rms_dbfs
+    cand = []
+    for i, r in enumerate(runs):
+        path = r.get("yVal") if preset == "short" else r.get("y")
+        if not path or not Path(path).exists():
+            continue
+        if level(path, None if preset == "short" else _V3_VALIDATION_SECONDS) > _HOLDBACK_LOUD_DBFS:
+            cand.append(i)
+    if len(cand) < 3:
+        return []
+    names = list(runs[cand[0]]["params"])
+    lo = {k: min(float(runs[i]["params"][k]) for i in cand) for k in names}
+    hi = {k: max(float(runs[i]["params"][k]) for i in cand) for k in names}
+    pts = [[(float(runs[i]["params"][k]) - lo[k]) / ((hi[k] - lo[k]) or 1.0) for k in names] for i in cand]
+    dist = lambda a, b: sum((x - y) ** 2 for x, y in zip(a, b))  # noqa: E731
+    centre = [0.5] * len(names)
+    picked = [min(range(len(pts)), key=lambda j: dist(pts[j], centre))]
+    nearest = [dist(p, pts[picked[0]]) for p in pts]
+    while len(picked) < min(n, len(pts)):
+        j = max(range(len(pts)), key=lambda j: nearest[j])
+        picked.append(j)
+        nearest = [min(a, dist(p, pts[j])) for a, p in zip(nearest, pts)]
+    return sorted(cand[j] for j in picked)
+
+
+def data_config(runs: list[dict], preset: str, signals: dict, is_silent=None,
+                holdback: int = 0, held_out: list | None = None) -> dict:
     """
     One entry per recorded run.
 
@@ -319,6 +389,10 @@ def data_config(runs: list[dict], preset: str, signals: dict, is_silent=None) ->
     one silent take's ratio is noise in the thousands (a real session scored
     5,925 after its first epoch), which would decide which checkpoint is kept.
     is_silent(path, last_seconds) says which; without it nothing is left out.
+
+    holdback: with at least HOLDBACK_FROM_RUNS runs, that many whole runs are held back
+    (pick_holdback) and only they validate; every other run only trains. Their indexes
+    are appended to held_out when given.
     """
     train, validation = [], []
     if not runs:
@@ -329,21 +403,27 @@ def data_config(runs: list[dict], preset: str, signals: dict, is_silent=None) ->
     else:
         rate = _wav_frames(signals["v3"])[1] if Path(signals["v3"]).exists() else 48000
         val_ny = _validation_ny(runs, int(_V3_VALIDATION_SECONDS * rate))
-    for run in runs:
+    held = set(pick_holdback(runs, preset, holdback)) if holdback and len(runs) >= HOLDBACK_FROM_RUNS else set()
+    if held_out is not None:
+        held_out.extend(sorted(held))
+    for i, run in enumerate(runs):
         base = {"params": {k: float(v) for k, v in run["params"].items()},
                 "delay": int(run.get("delay") or 0)}
+        validates = not held or i in held
         if preset == "short":
-            train.append({**base, "x_path": signals["short_train"], "y_path": run["y"],
-                          "start_seconds": 0.0, "stop_seconds": None, "ny": 8192})
-            if run.get("yVal") and not (is_silent and is_silent(run["yVal"], None)):
+            if i not in held:
+                train.append({**base, "x_path": signals["short_train"], "y_path": run["y"],
+                              "start_seconds": 0.0, "stop_seconds": None, "ny": 8192})
+            if validates and run.get("yVal") and not (is_silent and is_silent(run["yVal"], None)):
                 validation.append({**base, "x_path": signals["short_val"],
                                    "y_path": run["yVal"], "start_seconds": 0.0,
                                    "stop_seconds": None, "ny": val_ny,
                                    "require_input_pre_silence": None})
         else:
-            train.append({**base, "x_path": signals["v3"], "y_path": run["y"],
-                          "start_seconds": 10.0, "stop_seconds": -9.0, "ny": 8192})
-            if is_silent and is_silent(run["y"], _V3_VALIDATION_SECONDS):
+            if i not in held:
+                train.append({**base, "x_path": signals["v3"], "y_path": run["y"],
+                              "start_seconds": 10.0, "stop_seconds": -9.0, "ny": 8192})
+            if not validates or (is_silent and is_silent(run["y"], _V3_VALIDATION_SECONDS)):
                 continue
             validation.append({**base, "x_path": signals["v3"], "y_path": run["y"],
                                "start_seconds": -9.0, "stop_seconds": None, "ny": val_ny,
@@ -489,11 +569,17 @@ class TrainJob:
         self.state = "running"
         self.error = None
         self.chains = [{"name": c["name"], "modelName": _safe_name(c["modelName"]),
-                        "state": "waiting", "epoch": 0, "bestEsr": None, "silentLeftOut": 0,
+                        "state": "waiting", "epoch": 0, "bestEsr": None, "silentLeftOut": 0, "heldBack": [],
                         "runDir": None, "files": [], "log": None}
                        for c in request["chains"]]
         self.current = 0
-        self.epochs = int(request.get("epochs") or 400)
+        first = (request.get("chains") or [{}])[0].get("runs") or []
+        held = HOLDBACK_RUNS if request.get("holdBack", True) and len(first) >= HOLDBACK_FROM_RUNS else 0
+        ep = request.get("epochs")
+        self.epochs = default_epochs(len(first) - held, request.get("preset") or "v3") \
+            if ep in (None, "", "auto") else int(ep)
+        ch = request.get("channels")
+        self.channels = default_channels(len(request.get("knobs") or [])) if ch in (None, "", "auto") else int(ch)
         self.started = time.time()
         self.finished = None
         self._proc = None
@@ -536,6 +622,7 @@ class TrainJob:
             "error": self.error,
             "outDir": str(self.out_dir),
             "epochs": self.epochs,
+            "channels": self.channels,
             "current": self.current,
             "chains": self.chains,
             "elapsed": (self.finished or time.time()) - self.started,
@@ -584,11 +671,15 @@ class TrainJob:
         knobs = self.request["knobs"]
         info["state"] = "checking"
         silent = lambda path, last: clip_rms_dbfs(path, last) < SILENT_DBFS  # noqa: E731
-        data = data_config(spec["runs"], preset, local_signals, silent)
-        info["silentLeftOut"] = len(spec["runs"]) - len(data["validation"])
+        held: list[int] = []
+        data = data_config(spec["runs"], preset, local_signals, silent,
+                           holdback=HOLDBACK_RUNS if self.request.get("holdBack", True) else 0, held_out=held)
+        info["heldBack"] = [spec["runs"][i].get("run") for i in held]
+        info["silentLeftOut"] = (len(held) if held else len(spec["runs"])) - len(data["validation"])
         files = {
             "data": data,
-            "model": model_config(knobs, self.request.get("knobMapping") or DEFAULT_KNOB_MAPPING),
+            "model": model_config(knobs, self.request.get("knobMapping") or DEFAULT_KNOB_MAPPING,
+                                  self.channels, self.epochs),
             "learning": learning_config(self.epochs),
         }
         for name, payload in files.items():

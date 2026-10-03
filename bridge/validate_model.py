@@ -112,6 +112,68 @@ def score(y, y_hat):
     }
 
 
+# Safety check: a model can run away at knob settings far from anything it trained on -
+# every model scored on 2026-10-03 did, at the corners of the knob range. In a plugin that
+# is a burst of noise. Before a model is used, play it at the extremes and at random
+# settings, and report every one whose output runs away.
+STABILITY_SECONDS = 10.0
+STABILITY_RANDOM = 24
+RUNAWAY_PEAK = 2.0                 # +6 dBFS: far past anything a real amp recording reaches
+
+
+def two_level(n_knobs):
+    """Signs for a balanced two-level design: every knob at both ends, few runs."""
+    import itertools
+    k = n_knobs if n_knobs <= 3 else 3 if n_knobs <= 4 else 4 if n_knobs <= 8 else 5
+    base = list(itertools.product([-1, 1], repeat=k))
+    gens = [c for size in (k - 1, k - 2, 3, 2) if size >= 2
+            for c in itertools.combinations(range(k), size)]
+    seen, extra = set(), []
+    for c in gens:
+        if c not in seen:
+            seen.add(c); extra.append(c)
+    rows = []
+    for b in base:
+        row = list(b)
+        for c in extra[:n_knobs - k]:
+            v = 1
+            for i in c:
+                v *= b[i]
+            row.append(v)
+        rows.append(row)
+    return rows
+
+
+def stability_settings(params, seed=7):
+    lo = [float(p["min"]) for p in params]; hi = [float(p["max"]) for p in params]
+    n = len(params)
+    sets = [hi[:], lo[:], [hi[i] if i % 2 == 0 else lo[i] for i in range(n)],
+            [lo[i] if i % 2 == 0 else hi[i] for i in range(n)]]
+    sets += [[hi[i] if s > 0 else lo[i] for i, s in enumerate(row)] for row in two_level(n)]
+    rng = np.random.default_rng(seed)
+    for _ in range(STABILITY_RANDOM):
+        sets.append([float(round(lo[i] + rng.random() * (hi[i] - lo[i]))) for i in range(n)])
+    unique = []
+    for s in sets:
+        if s not in unique:
+            unique.append(s)
+    return unique
+
+
+def stability(model, names, params, x, rate):
+    clip = torch.from_numpy(x[: int(STABILITY_SECONDS * rate)])
+    flagged, settings = [], stability_settings(params)
+    for vals in settings:
+        with torch.no_grad():
+            out = model(clip, torch.tensor(vals, dtype=torch.float32)).cpu().numpy().flatten()
+        finite = bool(np.all(np.isfinite(out)))
+        peak = float(np.max(np.abs(out))) if finite else float("inf")
+        if not finite or peak > RUNAWAY_PEAK:
+            flagged.append({"params": dict(zip(names, vals)),
+                            "peakDb": None if not finite else round(20 * np.log10(peak), 1)})
+    return {"checked": len(settings), "flagged": flagged}
+
+
 def main():
     request = json.loads(Path(sys.argv[1]).read_text())
     out_path = Path(sys.argv[2])
@@ -150,6 +212,9 @@ def main():
                 y_al, p_al = y, pred
             runs[str(h["run"])] = score(y_al, p_al)
             write_wav(run_dir / "holdout_renders" / f"{y_path.stem}_model.wav", pred, rate)
+        print(f"progress: {chain['name']} safety check", flush=True)
+        params = json.loads((run_dir / "config_model.json").read_text())["net"]["config"]["params"]
+        safety = stability(model, names, params, x, rate)
         rated = [r["score"] for r in runs.values() if r.get("score") is not None]
         result["chains"].append({
             "name": chain["name"],
@@ -157,6 +222,8 @@ def main():
             "runs": runs,
             "average": float(np.mean(rated)) if rated else None,
             "worst": float(np.max(rated)) if rated else None,
+            "median": float(np.median(rated)) if rated else None,
+            "stability": safety,
         })
     out_path.write_text(json.dumps(result))
 

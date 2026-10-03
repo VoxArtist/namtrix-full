@@ -137,6 +137,64 @@ check("learning: template untouched", training._LEARNING["trainer"]["max_epochs"
       and training._LEARNING["trainer"]["max_epochs"] == 400)
 check("learning: not pinned to MPS", training.learning_config(1)["trainer"]["accelerator"] == "auto")
 
+# --- width, length and decay by the size of the job ---
+check("width: 8 channels up to 7 knobs", training.default_channels(7) == 8)
+check("width: 16 channels from 8 knobs", training.default_channels(8) == 16 and training.default_channels(9) == 16)
+m16 = training.model_config([{"name": "Drive", "min": 0, "max": 10}], "larger", 16, 300)
+check("16 channels: width applied", m16["net"]["config"]["layers"][0]["channels"] == 16)
+check("16 channels: half the learning rate", m16["optimizer"]["lr"] == 0.001)
+check("decay ends at 9% of the start", abs(m16["lr_scheduler"]["kwargs"]["gamma"] ** 300 - 0.09) < 0.002,
+      m16["lr_scheduler"]["kwargs"]["gamma"])
+m8 = training.model_config([{"name": "Drive", "min": 0, "max": 10}])
+check("8 channels: unchanged defaults", m8["net"]["config"]["layers"][0]["channels"] == 8
+      and m8["optimizer"]["lr"] == 0.002 and m8["lr_scheduler"]["kwargs"]["gamma"] == 0.994)
+check("template layer untouched", training._LAYER["channels"] == 8)
+check("epochs: a 110-run short session trains about as long as the best models did",
+      350 <= training.default_epochs(100, "short") <= 400, training.default_epochs(100, "short"))
+check("epochs: more runs, fewer epochs", training.default_epochs(300, "short") < training.default_epochs(100, "short"))
+check("epochs: never under 100 or over 400",
+      training.default_epochs(5000, "short") == 100 and training.default_epochs(3, "v3") == 400)
+try:
+    training.model_config([{"name": "Drive", "min": 0, "max": 10}], "larger", 12)
+    check("an unsupported width is refused", False)
+except training.TrainingError:
+    check("an unsupported width is refused", True)
+
+# --- holding whole runs back to choose the checkpoint ---
+import random as _random
+with tempfile.TemporaryDirectory() as tmp:
+    rnd = _random.Random(3)
+    def tone(path, amp):
+        with _wave.open(str(path), "wb") as w:
+            w.setnchannels(1); w.setsampwidth(3); w.setframerate(48000)
+            w.writeframes(int(amp * 2**23).to_bytes(3, "little", signed=True) * 4800)
+    val = Path(tmp) / "validation.wav"
+    tone(val, 0.0)
+    with _wave.open(str(val), "wb") as w:                  # 7 s, like the real cut
+        w.setnchannels(1); w.setsampwidth(3); w.setframerate(48000); w.writeframes(b"\x00\x00\x00" * 336000)
+    runs = []
+    for i in range(60):
+        y, yv = Path(tmp) / f"run_{i}.wav", Path(tmp) / f"run_{i}_val.wav"
+        loud = i % 6 != 0                                  # every sixth run is near-silent
+        tone(y, 0.3 if loud else 0.0001); tone(yv, 0.3 if loud else 0.0001)
+        runs.append({"y": str(y), "yVal": str(yv), "delay": 866, "run": i + 1,
+                     "params": {"Drive": rnd.randint(0, 10), "Tone": rnd.randint(0, 10)}})
+    sig = {**SIGNALS, "short_val": str(val)}
+    held = []
+    d = training.data_config(runs, "short", sig, None, holdback=10, held_out=held)
+    check("hold-back: 10 whole runs held back", len(held) == 10, held)
+    check("hold-back: only loud runs are held back", all(i % 6 != 0 for i in held), held)
+    check("hold-back: held runs never train", len(d["train"]) == 50
+          and not {e["y_path"] for e in d["train"]} & {runs[i]["y"] for i in held})
+    check("hold-back: only held runs validate", sorted(e["y_path"] for e in d["validation"])
+          == sorted(runs[i]["yVal"] for i in held))
+    spread = [(runs[i]["params"]["Drive"], runs[i]["params"]["Tone"]) for i in held]
+    check("hold-back: spread across the knob space",
+          max(a for a, _ in spread) - min(a for a, _ in spread) >= 6
+          and max(b for _, b in spread) - min(b for _, b in spread) >= 6, spread)
+    small = training.data_config(runs[:30], "short", sig, None, holdback=10, held_out=(h2 := []))
+    check("hold-back: a small session keeps every run training", not h2 and len(small["train"]) == 30)
+
 # --- names ---
 check("safe name strips path characters", training._safe_name('Marshall/1987x: "Reissue".nam') == "Marshall_1987x_ _Reissue_")
 check("empty name falls back", training._safe_name("  ") == "model")
